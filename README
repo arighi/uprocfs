@@ -1,0 +1,196 @@
+=== uprocfs: procfs in userspace ===
+
+Overview
+~~~~~~~~
+uprocfs is a user-space implementation of the kernel's procfs.
+
+Its purpose is not to replace procfs, but to speedup the retrievel of certain
+informations without scanning all the files under /proc.
+
+uprocfs is designed to be ultra-super-fast to retrieve specific informations,
+compared to the standard procfs interface.
+
+Usage
+~~~~~
+ - mount uproc filesystem to /uproc:
+   # ./uproc /urpoc
+
+See also:
+   # ./uproc --help
+
+Design
+~~~~~~
+The basic idea is to provide a facility to implement different views of the
+procfs based on uid and gid.
+
+The hierarchy of uprocfs might look as follows:
+
+                     uprocfs
+                        |
+                        v
+            _________________________
+           |                         |
+           v                         v
+          uid                       gid
+           |                         |
+           v                         v
+      ________________           ________________
+     |     |     ...  |         |     |     ...  |
+     v     v          v         v     v          v
+     uid1  uid2       uidN      gid1  gid2       gidM
+     |  |                       |  |
+     v  v                       v  v
+   pid1 pid2 ...              pid1 pid2 ...
+
+Different views of the proc filesystem are represented as directories in the
+root of the uproc filesystem.
+
+Elements of each view are represented as files.
+
+Looking at the diagram below:
+  - uid, gid: are represented as directories
+  - uid1 ... uidN, gid1 ... gidM: are represented as files
+  - pid1, pid2, ...: are represented as the content of the file they refer
+
+A userspace daemon, called uproc, listens to all kernel events that involves
+creation, exit, UID/GID change of any process in the system and stores all
+these informations to internal data structures, that are designed to speedup
+specific interrogations to the filesystem.
+
+Then, it exports different procfs views to the external applications using a
+FUSE filesystem (http://fuse.sourceforge.net/).
+
+Performance results
+~~~~~~~~~~~~~~~~~~~
+
+Following is reported a simple test that was used to measure the advantages of
+using the uproc interface respect to the classic procps interface.
+
+Test case:
+ - UID 1000 create 10K tasks:
+   $ for i in `seq 1 10000`; do sleep 10000 & done
+
+ - select all the PIDs of UID 1000:
+
+   - a simple grep in /proc:
+
+     # time grep "Uid:[[:space:]]*1000[[:space:]]" /proc/*/status | wc -l
+     10057
+
+     real	0m0.355s
+     user	0m0.070s
+     sys	0m0.287s
+
+   - with procps:
+
+     # time pgrep -u 1000 | wc -l
+     10057
+
+     real	0m0.248s
+     user	0m0.038s
+     sys	0m0.211s
+
+   - with uprocfs:
+
+     # time wc -l < /uproc/uid/1000 
+     10057
+
+     real	0m0.015s
+     user	0m0.000s
+     sys	0m0.005s
+
+For this particular test uproc is ~23.6 times faster than a simple grep in
+/proc and ~16.5 faster than pgrep!
+
+Overhead added to the system:
+
+  - to measure the overhead in the system we ran hackbench (a fork-intensive
+    application) and compared the benchmark result with and without the uproc
+    daemon running:
+
+    - without uproc
+      $ ./hackbench 100: average time 4.789
+
+    - with uproc
+      $ ./hackbench 100: average time 4.860
+
+With uproc the performance of hackbench are reduced by 1.5%.
+
+However, we need to consider that peformance regression impacts in the
+creation/exit of tasks and hackbench is a fork/exit intensive application.
+
+The performance of all the other applications in the system are not affected at
+all, and in the worst case (hackbench) performance are reduced only by a factor
+of 1.5%.
+
+Examples
+~~~~~~~~
+NOTE: all the following examples assume uprocfs is mounted on /uproc.
+
+ - show all the running PIDs of UID 1000:
+
+# cat /uproc/uid/1000
+
+ - count the tasks of UID 1000:
+
+# wc -l < /uproc/uid/1000
+55 /uproc/uid/1000
+
+ - show all programs currently executed by UID 1000:
+
+# sort -u `cat /uproc/uid/1000 | sed 's:\(.*\):/proc/\1/comm:'`
+bash
+dbus-daemon
+dbus-launch
+fetchmail
+fluxbox
+gconfd-2
+gconf-helper
+gnome-keyring-d
+gnome-power-man
+gnome-pty-helpe
+gnome-settings-
+gnome-volume-co
+gvfs-afc-volume
+gvfsd
+gvfsd-burn
+gvfs-fuse-daemo
+gvfs-gdu-volume
+gvfs-gphoto2-vo
+mutt
+nautilus
+parcellite
+pidgin
+pulseaudio
+ssh-agent
+syndaemon
+xterm
+
+ - send a SIGTERM to all processes of UID 1000 (kill UID sessions):
+
+# kill `cat /uproc/uid/1000`
+
+ - show all bytes read and written by UID 1000 from block devices:
+
+# echo `sed -ne "s/^read_bytes: //p" $(cat /uproc/uid/1000 | sed 's:\(.*\):/proc/\1/io:') | tr "\n" +`0 | bc -l
+141639680
+# echo `sed -ne "s/^write_bytes: //p" $(cat /uproc/uid/1000 | sed 's:\(.*\):/proc/\1/io:') | tr "\n" +`0 | bc -l
+4071424
+
+BUGS
+~~~~
+The solution used to implement the uproc daemon involves few concerns:
+
+ - poor reliability of netlink socket (messages can be dropped)
+
+ - delay incurred since a proc event took place and PID was actually reported
+   in the uprocfs
+
+TODO
+~~~~
+ - provide a way to define different views of the procfs (not only
+   per-uid/per-gid), using a configuration file (i.e, based on task name, or
+   select processes only of a certain UID, etc.)
+
+ - consider to use an alternative way to report proc events to userspace (stop
+   using netlink and maybe introduce a dedicate support in the kernel)
