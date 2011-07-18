@@ -4,7 +4,7 @@ Overview
 ~~~~~~~~
 uprocfs is a user-space implementation of the kernel's procfs.
 
-Its purpose is not to replace procfs, but to speedup the retrievel of certain
+Its purpose is not to replace procfs, but to speed up the retrievel of certain
 informations without scanning all the files under /proc.
 
 uprocfs is designed to be ultra-super-fast to retrieve specific informations,
@@ -52,9 +52,9 @@ Looking at the diagram below:
   - uid1 ... uidN, gid1 ... gidM: are represented as files
   - pid1, pid2, ...: are represented as the content of the file they refer
 
-A userspace daemon, called uproc, listens to all kernel events that involves
+A userspace daemon, called uproc, listens to all kernel events that involve
 creation, exit, UID/GID change of any process in the system and stores all
-these informations to internal data structures, that are designed to speedup
+these informations to internal data structures, that are designed to speed up
 specific interrogations to the filesystem.
 
 Then, it exports different procfs views to the external applications using a
@@ -190,7 +190,9 @@ TODO
 ~~~~
  - provide a way to define different views of the procfs (not only
    per-uid/per-gid), using a configuration file (i.e, based on task name, or
-   select processes only of a certain UID, etc.)
+   select processes only of a certain UID, etc.); this could be a way to
+   implement PID namespaces or to perform PID remapping (map some tasks to a
+   different range of PIDs in uprocfs)
 
  - consider to use an alternative way to report proc events to userspace (stop
    using netlink and maybe introduce a dedicate support in the kernel)
