@@ -141,6 +141,10 @@ static struct namespace ns[] = {
 /* Total amount of supported namespaces */
 #define TYPE_MAX	ARRAY_SIZE(ns)
 
+/* Namespace iterator */
+#define for_each_namespace(__type)				\
+		for (__type = 0; __type < TYPE_MAX; __type++)
+
 static inline struct hlist_head *hash_from_pid(enum key_type type)
 {
 	return ns[type].pid_key;
@@ -379,7 +383,7 @@ static void pid_key_remove(pid_t pid)
 	int type;
 
 	pthread_spin_lock(&lock);
-	for (type = 0; type < TYPE_MAX; type++) {
+	for_each_namespace(type) {
 		item = pid_find_item(type, pid);
 		if (likely(item)) {
 			hlist_del(&item->hlist);
@@ -601,11 +605,11 @@ static int uproc_readdir(const char *path, void *buf,
 	int type;
 
 	if (!strcmp(path, "/")) {
-		for (type = 0; type < TYPE_MAX; type++)
+		for_each_namespace(type)
 			filler(buf, ns[type].name, NULL, 0);
 		return 0;
 	}
-	for (type = 0; type < TYPE_MAX; type++) {
+	for_each_namespace(type) {
 		snprintf(name, sizeof(name), "/%s", ns[type].name);
 		if (!strncmp(path, name, sizeof(name)))
 			return _readdir(type, buf, filler, offset, fi);
@@ -654,7 +658,7 @@ static int uproc_getattr(const char *path, struct stat *stbuf)
 		stbuf->st_nlink = 2;
 		return 0;
 	}
-	for (type = 0; type < TYPE_MAX; type++) {
+	for_each_namespace(type) {
 		snprintf(name, sizeof(name), "/%s", ns[type].name);
 		if (!strncmp(path, name, sizeof(name))) {
 			stbuf->st_mode = S_IFDIR | 0555;
@@ -662,7 +666,7 @@ static int uproc_getattr(const char *path, struct stat *stbuf)
 			return 0;
 		}
 	}
-	for (type = 0; type < TYPE_MAX; type++) {
+	for_each_namespace(type) {
 		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
 		if (sscanf(path, name, &key) == 1)
 			return _getattr(type, key, stbuf);
@@ -695,7 +699,7 @@ static int uproc_open(const char *path, struct fuse_file_info *fi)
 	char name[FILENAME_MAX];
 	int type, key;
 
-	for (type = 0; type < TYPE_MAX; type++) {
+	for_each_namespace(type) {
 		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
 		if (sscanf(path, name, &key) == 1)
 			return _open(type, key, fi);
@@ -741,7 +745,7 @@ static int uproc_read(const char *path, char *buf, size_t size,
 	char name[FILENAME_MAX];
 	int type, key;
 
-	for (type = 0; type < TYPE_MAX; type++) {
+	for_each_namespace(type) {
 		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
 		if (sscanf(path, name, &key) == 1)
 			return _read(type, key, buf, size, offset, fi);
@@ -809,7 +813,7 @@ static void uproc_destory(void *unused)
 
 	pthread_spin_destroy(&lock);
 
-	for (type = 0; type < TYPE_MAX; type++) {
+	for_each_namespace(type) {
 		key_cleanup(type);
 		pid_cleanup(type);
 	}
