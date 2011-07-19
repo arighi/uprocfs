@@ -84,8 +84,8 @@ static pthread_spinlock_t lock;
 /* Internal hash structures */
 #define PROC_UID_HASH_SHIFT	10
 #define PROC_UID_HASH_SIZE	(1UL << PROC_UID_HASH_SHIFT)
-#define proc_id_hashfn(__uid) \
-		hash_long((unsigned long)__uid, PROC_UID_HASH_SHIFT)
+#define key_hashfn(__key) \
+		hash_long((unsigned long)__key, PROC_UID_HASH_SHIFT)
 
 /* Used to store PID -> UID mapping */
 struct pid_item {
@@ -156,7 +156,7 @@ static struct pid_item *pid_find_item(enum key_type type, pid_t pid)
 	struct pid_item *item;
 	struct hlist_head *hash = hash_from_pid(type);
 
-	hlist_for_each_entry(item, n, &hash[proc_id_hashfn(pid)], hlist)
+	hlist_for_each_entry(item, n, &hash[key_hashfn(pid)], hlist)
 		if (item->pid == pid)
 			return item;
 	return NULL;
@@ -172,7 +172,7 @@ static struct pid_item *pid_add_item(enum key_type type, pid_t pid, int key)
 		return NULL;
 	item->pid = pid;
 	item->key = key;
-	hlist_add_head(&item->hlist, &hash[proc_id_hashfn(pid)]);
+	hlist_add_head(&item->hlist, &hash[key_hashfn(pid)]);
 
 	return item;
 }
@@ -205,7 +205,7 @@ static struct key_item *key_find_item(enum key_type type, int key)
 	struct key_item *item;
 	struct hlist_head *hash = hash_from_key(type);
 
-	hlist_for_each_entry(item, n, &hash[proc_id_hashfn(key)], hlist)
+	hlist_for_each_entry(item, n, &hash[key_hashfn(key)], hlist)
 		if (item->key == key)
 			return item;
 	return NULL;
@@ -221,7 +221,7 @@ static struct key_item *key_add_item(enum key_type type, int key)
 		return NULL;
 	item->key = key;
 	INIT_LIST_HEAD(&item->list);
-	hlist_add_head(&item->hlist, &hash[proc_id_hashfn(key)]);
+	hlist_add_head(&item->hlist, &hash[key_hashfn(key)]);
 
 	return item;
 }
