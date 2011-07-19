@@ -82,19 +82,19 @@ static volatile bool need_exit;
 static pthread_spinlock_t lock;
 
 /* Internal hash structures */
-#define PROC_UID_HASH_SHIFT	10
-#define PROC_UID_HASH_SIZE	(1UL << PROC_UID_HASH_SHIFT)
+#define PROC_KEY_HASH_SHIFT	10
+#define PROC_KEY_HASH_SIZE	(1UL << PROC_KEY_HASH_SHIFT)
 #define key_hashfn(__key) \
-		hash_long((unsigned long)__key, PROC_UID_HASH_SHIFT)
+		hash_long((unsigned long)__key, PROC_KEY_HASH_SHIFT)
 
-/* Used to store PID -> UID mapping */
+/* Used to store PID -> KEY mapping */
 struct pid_item {
 	struct hlist_node hlist;
 	pid_t pid;
 	int key;
 };
 
-/* Used to map a UID to a list of PIDs */
+/* Used to map a KEY to a list of PIDs */
 struct key_item {
 	struct hlist_node hlist;
 	struct list_head list;
@@ -113,17 +113,17 @@ enum key_type {
 };
 
 struct namespace {
-	struct hlist_head pid_key[PROC_UID_HASH_SIZE] __cacheline_aligned;
-	struct hlist_head key_pid[PROC_UID_HASH_SIZE] __cacheline_aligned;
+	struct hlist_head pid_key[PROC_KEY_HASH_SIZE] __cacheline_aligned;
+	struct hlist_head key_pid[PROC_KEY_HASH_SIZE] __cacheline_aligned;
 	const char *name;
 	enum key_type type;
 };
 
 #define DEFINE_NAMESPACE(__type, __name)				\
 	{								\
-		.pid_key = {[0 ... PROC_UID_HASH_SIZE - 1] =		\
+		.pid_key = {[0 ... PROC_KEY_HASH_SIZE - 1] =		\
 						HLIST_HEAD_INIT},	\
-		.key_pid = {[0 ... PROC_UID_HASH_SIZE - 1] =		\
+		.key_pid = {[0 ... PROC_KEY_HASH_SIZE - 1] =		\
 						HLIST_HEAD_INIT},	\
 		.type = (__type),					\
 		.name = (__name),					\
@@ -189,7 +189,7 @@ static void pid_cleanup(enum key_type type)
 	struct hlist_head *hash = hash_from_pid(type);
 	int i;
 
-	for (i = 0; i < PROC_UID_HASH_SIZE; i++) {
+	for (i = 0; i < PROC_KEY_HASH_SIZE; i++) {
 		hlist_for_each_entry_safe(item, n, p, &hash[i], hlist) {
 			hlist_del(&item->hlist);
 			free(item);
@@ -277,7 +277,7 @@ static void key_cleanup(enum key_type type)
 	struct hlist_head *hash = hash_from_key(type);
 	int i;
 
-	for (i = 0; i < PROC_UID_HASH_SIZE; i++)
+	for (i = 0; i < PROC_KEY_HASH_SIZE; i++)
 		hlist_for_each_entry_safe(item, n, p, &hash[i], hlist) {
 			list_for_each_entry_safe(node, pnode,
 						&item->list, node) {
@@ -577,7 +577,7 @@ static int _readdir(enum key_type type, void *buf,
 	int i;
 
 	pthread_spin_lock(&lock);
-	for (i = 0; i < PROC_UID_HASH_SIZE; i++)
+	for (i = 0; i < PROC_KEY_HASH_SIZE; i++)
 		hlist_for_each_entry(item, n, &hash[i], hlist) {
 			char str[FILENAME_MAX];
 
