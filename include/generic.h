@@ -32,4 +32,21 @@
 /* Structure aligned to the cahe line size */
 #define __cacheline_aligned __attribute__((__aligned__(CACHELINE_SIZE)))
 
+/* Are two types/vars the same type (ignoring qualifiers)? */
+#ifndef __same_type
+#define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
+#endif
+
+/* Force a compile-time error if condition is true */
+#define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int:-!!(e); }))
+
+/* &a[0] degrades to a pointer: a different type from an array */
+#define __must_be_array(a) BUILD_BUG_ON_ZERO(__same_type((a), &(a)[0]))
+
+/*
+ * Return the size of an array in elements (+ check that it is actually a
+ * static array and not a pointer).
+ */
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
+
 #endif /* _GENERIC_H */
