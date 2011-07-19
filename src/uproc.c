@@ -78,7 +78,7 @@ static pthread_t proc_listener_thr;
 /* Used to stop the proc listener thread */
 static volatile bool need_exit;
 
-/* Protect all the hash lists below */
+/* Protect all namespaces hash lists */
 static pthread_spinlock_t lock;
 
 /* Internal hash structures */
@@ -86,11 +86,6 @@ static pthread_spinlock_t lock;
 #define PROC_UID_HASH_SIZE	(1UL << PROC_UID_HASH_SHIFT)
 #define proc_id_hashfn(__uid) \
 		hash_long((unsigned long)__uid, PROC_UID_HASH_SHIFT)
-
-enum key_type {
-	TYPE_UID,
-	TYPE_GID,
-};
 
 /* Used to store PID -> UID mapping */
 struct pid_item {
@@ -112,62 +107,43 @@ struct key_item_node {
 	pid_t pid;
 };
 
-/* UID -> PID hash table */
-static struct hlist_head uid_pid[PROC_UID_HASH_SIZE] = {
-	[0 ... PROC_UID_HASH_SIZE - 1] = HLIST_HEAD_INIT,
+enum key_type {
+	TYPE_UID = 0,
+	TYPE_GID,
+
+	TYPE_MAX,
 };
 
-/* PID -> UID hash table */
-static struct hlist_head pid_uid[PROC_UID_HASH_SIZE] = {
-	[0 ... PROC_UID_HASH_SIZE - 1] = HLIST_HEAD_INIT,
+struct namespace {
+	struct hlist_head pid_key[PROC_UID_HASH_SIZE] __cacheline_aligned;
+	struct hlist_head key_pid[PROC_UID_HASH_SIZE] __cacheline_aligned;
+	enum key_type type;
+	const char *name;
 };
 
-/* GID -> PID hash table */
-static struct hlist_head gid_pid[PROC_UID_HASH_SIZE] = {
-	[0 ... PROC_UID_HASH_SIZE - 1] = HLIST_HEAD_INIT,
-};
-
-/* PID -> GID hash table */
-static struct hlist_head pid_gid[PROC_UID_HASH_SIZE] = {
-	[0 ... PROC_UID_HASH_SIZE - 1] = HLIST_HEAD_INIT,
-};
-
-static struct hlist_head *hash_from_pid(enum key_type key)
-{
-	struct hlist_head *hash;
-
-	switch (key) {
-		case TYPE_UID:
-			hash = pid_uid;
-			break;
-		case TYPE_GID:
-			hash = pid_gid;
-			break;
-		default:
-			assert(0);
-			break;
+#define DEFINE_NAMESPACE(__type, __name)				\
+	{								\
+		.pid_key = {[0 ... PROC_UID_HASH_SIZE - 1] =		\
+						HLIST_HEAD_INIT},	\
+		.key_pid = {[0 ... PROC_UID_HASH_SIZE - 1] =		\
+						HLIST_HEAD_INIT},	\
+		.type = (__type),					\
+		.name = (__name),					\
 	}
 
-	return hash;
+static struct namespace ns[TYPE_MAX] = {
+	DEFINE_NAMESPACE(TYPE_UID, "uid"),
+	DEFINE_NAMESPACE(TYPE_GID, "gid"),
+};
+
+static inline struct hlist_head *hash_from_pid(enum key_type type)
+{
+	return ns[type].pid_key;
 }
 
-static struct hlist_head *hash_from_key(enum key_type key)
+static inline struct hlist_head *hash_from_key(enum key_type type)
 {
-	struct hlist_head *hash;
-
-	switch (key) {
-		case TYPE_UID:
-			hash = uid_pid;
-			break;
-		case TYPE_GID:
-			hash = gid_pid;
-			break;
-		default:
-			assert(0);
-			break;
-	}
-
-	return hash;
+	return ns[type].key_pid;
 }
 
 /*** pid hash table ***/
@@ -361,16 +337,17 @@ static void pid_key_add(pid_t pid)
 	if (get_uid_gid_from_procfs(pid, &uid, &gid) < 0)
 		return;
 	pthread_spin_lock(&lock);
+	/* Add to uid namespace */
 	pid_add(TYPE_UID, pid, uid);
 	key_add(TYPE_UID, uid, pid);
-
+	/* Add to gid namespace */
 	pid_add(TYPE_GID, pid, gid);
 	key_add(TYPE_GID, gid, pid);
 	pthread_spin_unlock(&lock);
 }
 
 /*
- * A PID changed UID or GID, update hash lists
+ * A PID updated one of its key -> also update hash lists
  */
 static void pid_key_update(enum key_type type, pid_t pid, int key)
 {
@@ -389,24 +366,21 @@ static void pid_key_update(enum key_type type, pid_t pid, int key)
 }
 
 /*
- * Process exit -> remove from hash list
+ * PID exit -> remove from hash lists
  */
 static void pid_key_remove(pid_t pid)
 {
 	struct pid_item *item;
+	int type;
 
 	pthread_spin_lock(&lock);
-	item = pid_find_item(TYPE_UID, pid);
-	if (likely(item)) {
-		hlist_del(&item->hlist);
-		key_del(TYPE_UID, item->key, item->pid);
-		free(item);
-	}
-	item = pid_find_item(TYPE_GID, pid);
-	if (likely(item)) {
-		hlist_del(&item->hlist);
-		key_del(TYPE_GID, item->key, item->pid);
-		free(item);
+	for (type = 0; type < TYPE_MAX; type++) {
+		item = pid_find_item(type, pid);
+		if (likely(item)) {
+			hlist_del(&item->hlist);
+			key_del(type, item->key, item->pid);
+			free(item);
+		}
 	}
 	pthread_spin_unlock(&lock);
 }
@@ -591,8 +565,51 @@ out:
 
 /* FUSE stuff (uproc filesystem interface) */
 
-static int _getattr(enum key_type type, int key,
-			const char *path, struct stat *stbuf)
+static int _readdir(enum key_type type, void *buf,
+				fuse_fill_dir_t filler,
+				off_t offset, struct fuse_file_info *fi)
+{
+	struct hlist_head *hash = hash_from_key(type);
+	struct hlist_node *n;
+	struct key_item *item;
+	int i;
+
+	pthread_spin_lock(&lock);
+	for (i = 0; i < PROC_UID_HASH_SIZE; i++)
+		hlist_for_each_entry(item, n, &hash[i], hlist) {
+			char str[FILENAME_MAX];
+
+			snprintf(str, sizeof(str), "%u", item->key);
+			if (filler(buf, str, NULL, 0))
+				break;
+		}
+	pthread_spin_unlock(&lock);
+
+	return 0;
+}
+
+static int uproc_readdir(const char *path, void *buf,
+				fuse_fill_dir_t filler,
+				off_t offset, struct fuse_file_info *fi)
+{
+	char name[FILENAME_MAX];
+	int type;
+
+	if (!strcmp(path, "/")) {
+		for (type = 0; type < TYPE_MAX; type++)
+			filler(buf, ns[type].name, NULL, 0);
+		return 0;
+	}
+	for (type = 0; type < TYPE_MAX; type++) {
+		snprintf(name, sizeof(name), "/%s", ns[type].name);
+		if (!strncmp(path, name, sizeof(name)))
+			return _readdir(type, buf, filler, offset, fi);
+	}
+
+	return -ENOENT;
+}
+
+static int _getattr(enum key_type type, int key, struct stat *stbuf)
 {
 	struct key_item *item;
 	struct key_item_node *node;
@@ -621,68 +638,34 @@ out_unlock:
 
 static int uproc_getattr(const char *path, struct stat *stbuf)
 {
-	uid_t uid;
-	gid_t gid;
+	char name[FILENAME_MAX];
+	int key, type;
 
-	memset(stbuf, 0, sizeof(struct stat));
+	memset(stbuf, 0, sizeof(*stbuf));
 
-	if (!strcmp(path, "/") ||
-			!strcmp(path, "/uid") || !strcmp(path, "/gid")) {
+	if (!strcmp(path, "/")) {
 		stbuf->st_mode = S_IFDIR | 0555;
 		stbuf->st_nlink = 2;
 		return 0;
 	}
-	if (sscanf(path, "/uid/%d", &uid) == 1)
-		return _getattr(TYPE_UID, uid, path, stbuf);
-	if (sscanf(path, "/gid/%d", &gid) == 1)
-		return _getattr(TYPE_GID, gid, path, stbuf);
-
-	return -ENOENT;
-}
-
-static int _readdir(enum key_type type, const char *path, void *buf,
-				fuse_fill_dir_t filler,
-				off_t offset, struct fuse_file_info *fi)
-{
-	struct hlist_head *hash = hash_from_key(type);
-	struct hlist_node *n;
-	struct key_item *item;
-	int i;
-
-	pthread_spin_lock(&lock);
-	for (i = 0; i < PROC_UID_HASH_SIZE; i++)
-		hlist_for_each_entry(item, n, &hash[i], hlist) {
-			char str[FILENAME_MAX];
-
-			snprintf(str, sizeof(str), "%u", item->key);
-			if (filler(buf, str, NULL, 0))
-				break;
+	for (type = 0; type < TYPE_MAX; type++) {
+		snprintf(name, sizeof(name), "/%s", ns[type].name);
+		if (!strncmp(path, name, sizeof(name))) {
+			stbuf->st_mode = S_IFDIR | 0555;
+			stbuf->st_nlink = 2;
+			return 0;
 		}
-	pthread_spin_unlock(&lock);
-
-	return 0;
-}
-
-static int uproc_readdir(const char *path, void *buf,
-				fuse_fill_dir_t filler,
-				off_t offset, struct fuse_file_info *fi)
-{
-
-	if (!strcmp(path, "/")) {
-		filler(buf, "uid", NULL, 0);
-		filler(buf, "gid", NULL, 0);
-		return 0;
 	}
-	if (!strcmp(path, "/uid"))
-		return _readdir(TYPE_UID, path, buf, filler, offset, fi);
-	if (!strcmp(path, "/gid"))
-		return _readdir(TYPE_GID, path, buf, filler, offset, fi);
+	for (type = 0; type < TYPE_MAX; type++) {
+		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
+		if (sscanf(path, name, &key) == 1)
+			return _getattr(type, key, stbuf);
+	}
 
 	return -ENOENT;
 }
 
-static int _open(enum key_type type, int key,
-			const char *path, struct fuse_file_info *fi)
+static int _open(enum key_type type, int key, struct fuse_file_info *fi)
 {
 	struct key_item *item;
 	int ret = 0;
@@ -703,18 +686,18 @@ out_unlock:
 
 static int uproc_open(const char *path, struct fuse_file_info *fi)
 {
-	uid_t uid;
-	gid_t gid;
+	char name[FILENAME_MAX];
+	int type, key;
 
-	if (sscanf(path, "/uid/%d", &uid) == 1)
-		return _open(TYPE_UID, uid, path, fi);
-	if (sscanf(path, "/gid/%d", &gid) == 1)
-		return _open(TYPE_GID, gid, path, fi);
+	for (type = 0; type < TYPE_MAX; type++) {
+		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
+		if (sscanf(path, name, &key) == 1)
+			return _open(type, key, fi);
+	}
 	return -ENOENT;
 }
 
-static int _read(enum key_type type, int key,
-			const char *path, char *buf, size_t size,
+static int _read(enum key_type type, int key, char *buf, size_t size,
 			off_t offset, struct fuse_file_info *fi)
 {
 	struct key_item *item;
@@ -726,7 +709,7 @@ static int _read(enum key_type type, int key,
 		return 0;
 
 	pthread_spin_lock(&lock);
-	item = key_find_item(TYPE_UID, key);
+	item = key_find_item(type, key);
 	if (unlikely(!item)) {
 		ret = -ENOENT;
 		goto out_unlock;
@@ -749,13 +732,14 @@ out_unlock:
 static int uproc_read(const char *path, char *buf, size_t size,
 			off_t offset, struct fuse_file_info *fi)
 {
-	uid_t uid;
-	gid_t gid;
+	char name[FILENAME_MAX];
+	int type, key;
 
-	if (sscanf(path, "/uid/%d", &uid) == 1)
-		return _read(TYPE_UID, uid, path, buf, size, offset, fi);
-	if (sscanf(path, "/gid/%d", &gid) == 1)
-		return _read(TYPE_GID, gid, path, buf, size, offset, fi);
+	for (type = 0; type < TYPE_MAX; type++) {
+		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
+		if (sscanf(path, name, &key) == 1)
+			return _read(type, key, buf, size, offset, fi);
+	}
 
 	return -ENOENT;
 }
@@ -812,21 +796,22 @@ static void *uproc_init(struct fuse_conn_info *conn)
 /* Cleanup routine when uproc is unmounted */
 static void uproc_destory(void *unused)
 {
+	int type;
+
 	need_exit = true;
 	pthread_join(proc_listener_thr, NULL);
 
 	pthread_spin_destroy(&lock);
 
-	key_cleanup(TYPE_UID);
-	key_cleanup(TYPE_GID);
-
-	pid_cleanup(TYPE_UID);
-	pid_cleanup(TYPE_GID);
+	for (type = 0; type < TYPE_MAX; type++) {
+		key_cleanup(type);
+		pid_cleanup(type);
+	}
 }
 
 static struct fuse_operations uproc_fs = {
-	.getattr	= uproc_getattr,
 	.readdir	= uproc_readdir,
+	.getattr	= uproc_getattr,
 	.open		= uproc_open,
 	.read		= uproc_read,
 	.init		= uproc_init,
