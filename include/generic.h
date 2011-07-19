@@ -21,4 +21,15 @@
 #define max(x,y)	((y)<(x)?(x):(y))
 #define min(x,y)	((y)>(x)?(x):(y))
 
+/*
+ * Indirect stringification. Doing two levels allows the parameter to be a
+ * macro itself.  For example, compile with -DFOO=bar, __stringify(FOO)
+ * converts to "bar".
+ */
+#define __stringify_1(x...)	#x
+#define __stringify(x...)	__stringify_1(x)
+
+/* Structure aligned to the cahe line size */
+#define __cacheline_aligned __attribute__((__aligned__(CACHELINE_SIZE)))
+
 #endif /* _GENERIC_H */
