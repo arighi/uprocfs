@@ -81,6 +81,9 @@ static volatile bool need_exit;
 /* Protect all namespaces hash lists */
 static pthread_spinlock_t lock;
 
+/* Generic key type to identify the value of a PID property */
+typedef int key_t;
+
 /* Internal hash structures */
 #define PROC_KEY_HASH_SHIFT	10
 #define PROC_KEY_HASH_SIZE	(1UL << PROC_KEY_HASH_SHIFT)
@@ -91,14 +94,14 @@ static pthread_spinlock_t lock;
 struct pid_item {
 	struct hlist_node hlist;
 	pid_t pid;
-	int key;
+	key_t key;
 };
 
 /* Used to map a KEY to a list of PIDs */
 struct key_item {
 	struct hlist_node hlist;
 	struct list_head list;
-	int key;
+	key_t key;
 };
 
 /* Single element of the key_item list */
@@ -162,7 +165,7 @@ static struct pid_item *pid_find_item(enum key_type type, pid_t pid)
 	return NULL;
 }
 
-static struct pid_item *pid_add_item(enum key_type type, pid_t pid, int key)
+static struct pid_item *pid_add_item(enum key_type type, pid_t pid, key_t key)
 {
 	struct pid_item *item;
 	struct hlist_head *hash = hash_from_pid(type);
@@ -177,7 +180,7 @@ static struct pid_item *pid_add_item(enum key_type type, pid_t pid, int key)
 	return item;
 }
 
-static inline struct pid_item *pid_add(enum key_type type, pid_t pid, int key)
+static inline struct pid_item *pid_add(enum key_type type, pid_t pid, key_t key)
 {
 	return pid_add_item(type, pid, key);
 }
@@ -199,7 +202,7 @@ static void pid_cleanup(enum key_type type)
 
 /*** key hash table ***/
 
-static struct key_item *key_find_item(enum key_type type, int key)
+static struct key_item *key_find_item(enum key_type type, key_t key)
 {
 	struct hlist_node *n;
 	struct key_item *item;
@@ -211,7 +214,7 @@ static struct key_item *key_find_item(enum key_type type, int key)
 	return NULL;
 }
 
-static struct key_item *key_add_item(enum key_type type, int key)
+static struct key_item *key_add_item(enum key_type type, key_t key)
 {
 	struct key_item *item;
 	struct hlist_head *hash = hash_from_key(type);
@@ -226,7 +229,7 @@ static struct key_item *key_add_item(enum key_type type, int key)
 	return item;
 }
 
-static int key_add(enum key_type type, int key, pid_t pid)
+static int key_add(enum key_type type, key_t key, pid_t pid)
 {
 	struct key_item *item;
 	struct key_item_node *node;
@@ -248,7 +251,7 @@ static int key_add(enum key_type type, int key, pid_t pid)
 	return 0;
 }
 
-static int key_del(enum key_type type, int key, pid_t pid)
+static int key_del(enum key_type type, key_t key, pid_t pid)
 {
 	struct key_item *item;
 	struct key_item_node *node;
@@ -351,7 +354,7 @@ static void pid_key_add(pid_t pid)
 /*
  * A PID updated one of its key -> also update hash lists
  */
-static void pid_key_update(enum key_type type, pid_t pid, int key)
+static void pid_key_update(enum key_type type, pid_t pid, key_t key)
 {
 	struct pid_item *item;
 
@@ -611,7 +614,7 @@ static int uproc_readdir(const char *path, void *buf,
 	return -ENOENT;
 }
 
-static int _getattr(enum key_type type, int key, struct stat *stbuf)
+static int _getattr(enum key_type type, key_t key, struct stat *stbuf)
 {
 	struct key_item *item;
 	struct key_item_node *node;
@@ -641,7 +644,8 @@ out_unlock:
 static int uproc_getattr(const char *path, struct stat *stbuf)
 {
 	char name[FILENAME_MAX];
-	int key, type;
+	int type;
+	key_t key;
 
 	memset(stbuf, 0, sizeof(*stbuf));
 
@@ -667,7 +671,7 @@ static int uproc_getattr(const char *path, struct stat *stbuf)
 	return -ENOENT;
 }
 
-static int _open(enum key_type type, int key, struct fuse_file_info *fi)
+static int _open(enum key_type type, key_t key, struct fuse_file_info *fi)
 {
 	struct key_item *item;
 	int ret = 0;
@@ -699,7 +703,7 @@ static int uproc_open(const char *path, struct fuse_file_info *fi)
 	return -ENOENT;
 }
 
-static int _read(enum key_type type, int key, char *buf, size_t size,
+static int _read(enum key_type type, key_t key, char *buf, size_t size,
 			off_t offset, struct fuse_file_info *fi)
 {
 	struct key_item *item;
