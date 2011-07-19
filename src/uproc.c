@@ -110,15 +110,13 @@ struct key_item_node {
 enum key_type {
 	TYPE_UID = 0,
 	TYPE_GID,
-
-	TYPE_MAX,
 };
 
 struct namespace {
 	struct hlist_head pid_key[PROC_UID_HASH_SIZE] __cacheline_aligned;
 	struct hlist_head key_pid[PROC_UID_HASH_SIZE] __cacheline_aligned;
-	enum key_type type;
 	const char *name;
+	enum key_type type;
 };
 
 #define DEFINE_NAMESPACE(__type, __name)				\
@@ -131,10 +129,14 @@ struct namespace {
 		.name = (__name),					\
 	}
 
-static struct namespace ns[TYPE_MAX] = {
+/* Supported PID namespaces */
+static struct namespace ns[] = {
 	DEFINE_NAMESPACE(TYPE_UID, "uid"),
 	DEFINE_NAMESPACE(TYPE_GID, "gid"),
 };
+
+/* Total amount of supported namespaces */
+#define TYPE_MAX	ARRAY_SIZE(ns)
 
 static inline struct hlist_head *hash_from_pid(enum key_type type)
 {
