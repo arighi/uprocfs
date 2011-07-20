@@ -59,7 +59,7 @@ Usage
    gid 34 backup
 
  - mount uproc filesystem to /uproc:
-   # ./uproc -o config_file=/etc/uproc.conf /urpoc
+   # ./uproc -o config_file=/etc/uproc.conf /uproc
 
 This will create two different namespaces, that are represented as regular
 files inside uprocfs:
