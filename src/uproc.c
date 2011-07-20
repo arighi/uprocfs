@@ -28,9 +28,13 @@
 
 #define FUSE_USE_VERSION 29
 
+#define UPROCFS_VERSION __stringify(VERSION)
+
+#define DEFAULT_CONFIG_FILE	"/etc/uproc.conf"
+
 #include "list.h"
 
-#include <assert.h>
+#include <ctype.h>
 #include <fuse.h>
 #include <pthread.h>
 #include <dirent.h>
@@ -49,6 +53,8 @@
 #include <asm/bitsperlong.h>
 
 /* The following macros are all used by the netlink code */
+#define NL_BUFF_SIZE	(16 * 1024 * 1024)
+
 #define RECV_MESSAGE_LEN (NLMSG_LENGTH(sizeof(struct cn_msg) + \
 				sizeof(struct proc_event)))
 #define RECV_MESSAGE_SIZE (NLMSG_SPACE(RECV_MESSAGE_LEN))
@@ -75,11 +81,11 @@ typedef struct __attribute__ ((aligned(NLMSG_ALIGNTO))) {
 /* proc listener: thread that listens proc connector events via netlink */
 static pthread_t proc_listener_thr;
 
-/* Used to stop the proc listener thread */
-static volatile bool need_exit;
-
 /* Protect all namespaces hash lists */
 static pthread_spinlock_t lock;
+
+/* Used to stop the proc listener thread */
+static volatile bool need_exit;
 
 /* Generic key type to identify the value of a PID property */
 typedef int key_t;
@@ -94,74 +100,91 @@ typedef int key_t;
 struct pid_item {
 	struct hlist_node hlist;
 	pid_t pid;
-	key_t key;
 };
 
-/* Used to map a KEY to a list of PIDs */
-struct key_item {
-	struct hlist_node hlist;
-	struct list_head list;
-	key_t key;
-};
-
-/* Single element of the key_item list */
-struct key_item_node {
-	struct list_head node;
-	pid_t pid;
-};
-
+/* Type of namespace rule */
 enum key_type {
 	TYPE_UID = 0,
 	TYPE_GID,
 };
 
+/* Generic namespace definition */
 struct namespace {
-	struct hlist_head pid_key[PROC_KEY_HASH_SIZE] __cacheline_aligned;
-	struct hlist_head key_pid[PROC_KEY_HASH_SIZE] __cacheline_aligned;
-	const char *name;
+	struct hlist_head pid_list[PROC_KEY_HASH_SIZE];
+	struct list_head node;
+	char *name;
 	enum key_type type;
+	key_t key;
 };
 
-#define DEFINE_NAMESPACE(__type, __name)				\
-	{								\
-		.pid_key = {[0 ... PROC_KEY_HASH_SIZE - 1] =		\
-						HLIST_HEAD_INIT},	\
-		.key_pid = {[0 ... PROC_KEY_HASH_SIZE - 1] =		\
-						HLIST_HEAD_INIT},	\
-		.type = (__type),					\
-		.name = (__name),					\
+/* List of registered PID namespaces */
+static LIST_HEAD(namespace);
+
+/* Namespace iterators */
+#define for_each_namespace(__ns)					\
+	list_for_each_entry(__ns, &namespace, node)
+
+#define for_each_namespace_safe(__ns, __ns2)				\
+	list_for_each_entry_safe(__ns, __ns2, &namespace, node)
+
+#define for_each_namespace_pid(__ns, __item, __i, __n)			\
+	for (__i = 0; __i < PROC_KEY_HASH_SIZE; __i++)			\
+		hlist_for_each_entry(__item, __n,			\
+					&((__ns)->pid_list[__i]), hlist)
+
+#define for_each_namespace_pid_safe(__ns, __item, __i, __n, __p)	\
+	for (__i = 0; __i < PROC_KEY_HASH_SIZE; __i++)			\
+		hlist_for_each_entry_safe(__item, __n, __p,		\
+					&((__ns)->pid_list[i]), hlist)
+
+/* Find a namespace */
+static struct namespace *namespace_find(enum key_type type, key_t key)
+{
+	struct namespace *ns;
+
+	for_each_namespace(ns)
+		if (ns->type == type && ns->key == key)
+			return ns;
+	return NULL;
+}
+
+/* Register a new namespace rule */
+static int namespace_add(enum key_type type, key_t key, const char *name)
+{
+	struct namespace *ns;
+	int i;
+
+	ns = calloc(1, sizeof(*ns));
+	if (unlikely(!ns))
+		return -ENOMEM;
+	ns->name = strndup(name, FILENAME_MAX);
+	if (unlikely(!ns->name)) {
+		free(ns);
+		return -ENOMEM;
 	}
+	for (i = 0; i < PROC_KEY_HASH_SIZE; i++)
+		INIT_HLIST_HEAD(ns->pid_list);
+	ns->type = type;
+	ns->key = key;
+	list_add_tail(&ns->node, &namespace);
 
-/* Supported PID namespaces */
-static struct namespace ns[] = {
-	DEFINE_NAMESPACE(TYPE_UID, "uid"),
-	DEFINE_NAMESPACE(TYPE_GID, "gid"),
-};
-
-/* Total amount of supported namespaces */
-#define TYPE_MAX	ARRAY_SIZE(ns)
-
-/* Namespace iterator */
-#define for_each_namespace(__type)				\
-		for (__type = 0; __type < TYPE_MAX; __type++)
-
-static inline struct hlist_head *hash_from_pid(enum key_type type)
-{
-	return ns[type].pid_key;
+	return 0;
 }
 
-static inline struct hlist_head *hash_from_key(enum key_type type)
+/* Remove a namespace rule */
+static void namespace_del(struct namespace *ns)
 {
-	return ns[type].key_pid;
+	list_del(&ns->node);
+	free(ns->name);
+	free(ns);
 }
 
-/*** pid hash table ***/
-
-static struct pid_item *pid_find_item(enum key_type type, pid_t pid)
+/* Find a PID item inside a namespace */
+static struct pid_item *pid_find_item(struct namespace *ns, pid_t pid)
 {
-	struct hlist_node *n;
+	const struct hlist_head *hash = ns->pid_list;
 	struct pid_item *item;
-	struct hlist_head *hash = hash_from_pid(type);
+	struct hlist_node *n;
 
 	hlist_for_each_entry(item, n, &hash[key_hashfn(pid)], hlist)
 		if (item->pid == pid)
@@ -169,131 +192,42 @@ static struct pid_item *pid_find_item(enum key_type type, pid_t pid)
 	return NULL;
 }
 
-static struct pid_item *pid_add_item(enum key_type type, pid_t pid, key_t key)
+/* Add a PID to a namespace */
+static struct pid_item *pid_add_item(struct namespace *ns, pid_t pid)
 {
+	struct hlist_head *hash = ns->pid_list;
 	struct pid_item *item;
-	struct hlist_head *hash = hash_from_pid(type);
 
 	item = malloc(sizeof(*item));
 	if (unlikely(!item))
 		return NULL;
 	item->pid = pid;
-	item->key = key;
 	hlist_add_head(&item->hlist, &hash[key_hashfn(pid)]);
 
 	return item;
 }
 
-static inline struct pid_item *pid_add(enum key_type type, pid_t pid, key_t key)
-{
-	return pid_add_item(type, pid, key);
-}
-
-static void pid_cleanup(enum key_type type)
+/* Remove all PIDs from a namespace */
+static void pid_cleanup_items(struct namespace *ns)
 {
 	struct hlist_node *n, *p;
 	struct pid_item *item;
-	struct hlist_head *hash = hash_from_pid(type);
 	int i;
 
-	for (i = 0; i < PROC_KEY_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(item, n, p, &hash[i], hlist) {
-			hlist_del(&item->hlist);
-			free(item);
-		}
+	for_each_namespace_pid_safe(ns, item, i, n, p) {
+		hlist_del(&item->hlist);
+		free(item);
 	}
 }
 
-/*** key hash table ***/
-
-static struct key_item *key_find_item(enum key_type type, key_t key)
+/* Add a PID item */
+static struct pid_item *pid_add(enum key_type type, key_t key, pid_t pid)
 {
-	struct hlist_node *n;
-	struct key_item *item;
-	struct hlist_head *hash = hash_from_key(type);
+	struct namespace *ns = namespace_find(type, key);
 
-	hlist_for_each_entry(item, n, &hash[key_hashfn(key)], hlist)
-		if (item->key == key)
-			return item;
-	return NULL;
-}
-
-static struct key_item *key_add_item(enum key_type type, key_t key)
-{
-	struct key_item *item;
-	struct hlist_head *hash = hash_from_key(type);
-
-	item = malloc(sizeof(*item));
-	if (unlikely(!item))
+	if (unlikely(!ns))
 		return NULL;
-	item->key = key;
-	INIT_LIST_HEAD(&item->list);
-	hlist_add_head(&item->hlist, &hash[key_hashfn(key)]);
-
-	return item;
-}
-
-static int key_add(enum key_type type, key_t key, pid_t pid)
-{
-	struct key_item *item;
-	struct key_item_node *node;
-
-	item = key_find_item(type, key);
-	if (unlikely(!item))
-		item = key_add_item(type, key);
-		if (unlikely(!item))
-			return -ENOMEM;
-	list_for_each_entry(node, &item->list, node)
-		if (unlikely(node->pid == pid))
-			return -EADDRINUSE;
-	node = malloc(sizeof(*node));
-	if (unlikely(!node))
-		return -ENOMEM;
-	node->pid = pid;
-	list_add_tail(&node->node, &item->list);
-
-	return 0;
-}
-
-static int key_del(enum key_type type, key_t key, pid_t pid)
-{
-	struct key_item *item;
-	struct key_item_node *node;
-
-	item = key_find_item(type, key);
-	if (likely(item)) {
-		list_for_each_entry(node, &item->list, node)
-			if (node->pid == pid) {
-				list_del(&node->node);
-				free(node);
-				break;
-			}
-		if (list_empty(&item->list)) {
-			hlist_del(&item->hlist);
-			free(item);
-		}
-	}
-	return -ENOENT;;
-}
-
-static void key_cleanup(enum key_type type)
-{
-	struct hlist_node *n, *p;
-	struct key_item *item;
-	struct key_item_node *node, *pnode;
-	struct hlist_head *hash = hash_from_key(type);
-	int i;
-
-	for (i = 0; i < PROC_KEY_HASH_SIZE; i++)
-		hlist_for_each_entry_safe(item, n, p, &hash[i], hlist) {
-			list_for_each_entry_safe(node, pnode,
-						&item->list, node) {
-				list_del(&node->node);
-				free(node);
-			}
-			hlist_del(&item->hlist);
-			free(item);
-		}
+	return pid_add_item(ns, pid);
 }
 
 /*
@@ -303,7 +237,7 @@ static int get_uid_gid_from_procfs(pid_t pid, uid_t *euid, gid_t *egid)
 {
 	FILE *f;
 	char path[FILENAME_MAX];
-	char buf[4092];
+	char buf[PAGE_SIZE];
 	uid_t ruid, suid, fsuid;
 	gid_t rgid, sgid, fsgid;
 	bool found_euid = false;
@@ -336,62 +270,52 @@ static int get_uid_gid_from_procfs(pid_t pid, uid_t *euid, gid_t *egid)
 }
 
 /*
- * New process -> add to hash lists
+ * New PID -> add it to the right namespaces
  */
 static void pid_key_add(pid_t pid)
 {
+	struct namespace *ns;
 	uid_t uid;
 	gid_t gid;
 
 	if (get_uid_gid_from_procfs(pid, &uid, &gid) < 0)
 		return;
 	pthread_spin_lock(&lock);
-	/* Add to uid namespace */
-	pid_add(TYPE_UID, pid, uid);
-	key_add(TYPE_UID, uid, pid);
-	/* Add to gid namespace */
-	pid_add(TYPE_GID, pid, gid);
-	key_add(TYPE_GID, gid, pid);
-	pthread_spin_unlock(&lock);
-}
-
-/*
- * A PID updated one of its key -> also update hash lists
- */
-static void pid_key_update(enum key_type type, pid_t pid, key_t key)
-{
-	struct pid_item *item;
-
-	pthread_spin_lock(&lock);
-	item = pid_find_item(type, pid);
-	if (likely(item)) {
-		key_del(type, item->key, item->pid);
-		item->key = key;
-	} else {
-		item = pid_add(type, pid, key);
+	for_each_namespace(ns) {
+		if (ns->type == TYPE_UID && ns->key == uid)
+			pid_add(TYPE_UID, uid, pid);
+		if (ns->type == TYPE_GID && ns->key == gid)
+			pid_add(TYPE_GID, gid, pid);
 	}
-	key_add(type, item->key, pid);
 	pthread_spin_unlock(&lock);
 }
 
 /*
- * PID exit -> remove from hash lists
+ * PID exit -> remove it from namespaces
  */
 static void pid_key_remove(pid_t pid)
 {
+	struct namespace *ns;
 	struct pid_item *item;
-	int type;
 
 	pthread_spin_lock(&lock);
-	for_each_namespace(type) {
-		item = pid_find_item(type, pid);
-		if (likely(item)) {
+	for_each_namespace(ns) {
+		item = pid_find_item(ns, pid);
+		if (item) {
 			hlist_del(&item->hlist);
-			key_del(type, item->key, item->pid);
 			free(item);
 		}
 	}
 	pthread_spin_unlock(&lock);
+}
+
+/*
+ * PID updated one of its key -> also update the namespaces
+ */
+static void pid_key_update(pid_t pid)
+{
+	pid_key_remove(pid);
+	pid_key_add(pid);
 }
 
 /*** netlink stuff ***/
@@ -399,7 +323,7 @@ static void pid_key_remove(pid_t pid)
 static int nl_connect(void)
 {
 	struct sockaddr_nl sa_nl = {};
-	int buffersize = 16 * 1024 * 1024;
+	int buffersize = NL_BUFF_SIZE;
 	int nl_sock;
 	int ret;
 
@@ -477,12 +401,9 @@ static void handle_proc_ev(const struct cn_msg *cn_hdr)
 		pid_key_add(pid);
 		break;
 	case PROC_EVENT_UID:
-		pid = ev->event_data.id.process_pid;
-		pid_key_update(TYPE_UID, pid, ev->event_data.id.e.euid);
-		break;
 	case PROC_EVENT_GID:
 		pid = ev->event_data.id.process_pid;
-		pid_key_update(TYPE_GID, pid, ev->event_data.id.e.egid);
+		pid_key_update(pid);
 		break;
 	case PROC_EVENT_EXIT:
 		pid = ev->event_data.exit.process_pid;
@@ -572,84 +493,181 @@ out:
 	pthread_exit(NULL);
 }
 
-/* FUSE stuff (uproc filesystem interface) */
+/*** Configuration parser ***/
 
-static int _readdir(enum key_type type, void *buf,
-				fuse_fill_dir_t filler,
-				off_t offset, struct fuse_file_info *fi)
+static bool is_empty_or_comment(const char *line)
 {
-	struct hlist_head *hash = hash_from_key(type);
-	struct hlist_node *n;
-	struct key_item *item;
 	int i;
 
-	pthread_spin_lock(&lock);
-	for (i = 0; i < PROC_KEY_HASH_SIZE; i++)
-		hlist_for_each_entry(item, n, &hash[i], hlist) {
-			char str[FILENAME_MAX];
+	for (i = 0; i < strnlen(line, FILENAME_MAX); i++) {
+		if (line[i] == ';' || line[i] == '#')
+			return true;
+		if (!isspace(line[i]) && !iscntrl(line[i]))
+			return false;
+	}
+	return true;
+}
 
-			snprintf(str, sizeof(str), "%u", item->key);
-			if (filler(buf, str, NULL, 0))
-				break;
+static void strip_blank_head(char **p)
+{
+	char *s = *p;
+
+	while (isspace(*s))
+		s++;
+	*p = s;
+}
+
+static void strip_blank_tail(char *p)
+{
+	char *start = p, *s;
+
+	s = strchr(p, ';');
+	if (s)
+		*s = '\0';
+	s = strchr(p, '#');
+	if (s)
+		*s = '\0';
+	if (s)
+		p = s;
+
+	s = p + strlen(p);
+	while ((isspace(*s) || iscntrl(*s)) && (s > start))
+		s--;
+
+	*(s + 1) = '\0';
+}
+
+/* Simple config file parser */
+static int read_config(const char *file)
+{
+	char line[PAGE_SIZE];
+	char type_str[FILENAME_MAX];
+	char name[FILENAME_MAX];
+	int type;
+	key_t key;
+	char *p;
+	FILE *f;
+	int line_no = 0;
+	int ret;
+
+	if (!strcmp(file, "-"))
+		f = stdin;
+	else
+		f = fopen(file, "r");
+	if (!f) {
+		fprintf(stderr, "ERROR: couldn't open file %s\n", file);
+		return -ENOENT;
+	}
+	while ((p = fgets(line, sizeof(line), f)) != NULL) {
+		line_no++;
+
+		/* Strip heading and trailing spaces */
+		strip_blank_head(&p);
+		strip_blank_tail(p);
+
+		if (is_empty_or_comment(p))
+			continue;
+
+		ret = sscanf(line, "%256s %u %256s", type_str, &key, name);
+		if (ret != 3) {
+			fprintf(stderr, "ERROR: syntax error at %s:%d\n",
+					file, line_no);
+			return -EINVAL;
 		}
-	pthread_spin_unlock(&lock);
-
+		if (!strcmp(type_str, "uid")) {
+			type = TYPE_UID;
+		} else if (!strcmp(type_str, "gid")) {
+			type = TYPE_GID;
+		} else {
+			fprintf(stderr, "ERROR: unknown type '%s' at %s:%d\n",
+					type_str, file, line_no);
+			return -EINVAL;
+		}
+		ret = namespace_add(type, key, name);
+		if (ret < 0) {
+			fprintf(stderr,
+				"ERROR: couldn't register namespace %s: %d\n",
+				name, ret);
+			return -ENOMEM;
+		}
+	}
+	if (f != stdin)
+		fclose(f);
 	return 0;
 }
+
+/*** FUSE stuff (uproc filesystem interface) ***/
+
+/* uprocfs state and configuration */
+struct uproc_conf {
+	char *config_file;
+};
+static struct uproc_conf uproc_conf;
+
+/* Free internal fuse config memory */
+static void uproc_free_config(struct uproc_conf *conf)
+{
+	free(conf->config_file);
+}
+
+/* uprocfs custom command line options */
+enum {
+	KEY_VERSION = 0,
+	KEY_HELP,
+};
+
+#define UPROC_OPT(t, p, v) { t, offsetof(struct uproc_conf, p), v }
+
+static struct fuse_opt uproc_opts[] = {
+	UPROC_OPT("config_file=%s", config_file, 0),
+
+        FUSE_OPT_KEY("-V", KEY_VERSION),
+        FUSE_OPT_KEY("--version", KEY_VERSION),
+        FUSE_OPT_KEY("-h", KEY_HELP),
+        FUSE_OPT_KEY("--help", KEY_HELP),
+
+	FUSE_OPT_END,
+};
 
 static int uproc_readdir(const char *path, void *buf,
 				fuse_fill_dir_t filler,
 				off_t offset, struct fuse_file_info *fi)
 {
-	char name[FILENAME_MAX];
-	int type;
+	struct namespace *ns;
 
 	if (!strcmp(path, "/")) {
-		for_each_namespace(type)
-			filler(buf, ns[type].name, NULL, 0);
+		for_each_namespace(ns)
+			filler(buf, ns->name, NULL, 0);
 		return 0;
 	}
-	for_each_namespace(type) {
-		snprintf(name, sizeof(name), "/%s", ns[type].name);
-		if (!strncmp(path, name, sizeof(name)))
-			return _readdir(type, buf, filler, offset, fi);
-	}
-
 	return -ENOENT;
 }
 
-static int _getattr(enum key_type type, key_t key, struct stat *stbuf)
+/*
+ * The file size is evaluated looking at the size of all the PIDs inside the
+ * namespace it refers.
+ */
+static size_t namespace_size(const struct namespace *ns)
 {
-	struct key_item *item;
-	struct key_item_node *node;
-	int size = 0;
-	int ret = 0;
+	const struct hlist_node *n;
+	const struct pid_item *item;
+	size_t size = 0;
+	int i;
 
 	pthread_spin_lock(&lock);
-	item = key_find_item(type, key);
-	if (unlikely(!item)) {
-		ret = -ENOENT;
-		goto out_unlock;
-	}
-	list_for_each_entry(node, &item->list, node) {
-		char buf[FILENAME_MAX];
+	for_each_namespace_pid(ns, item, i, n) {
+		char str[FILENAME_MAX];
 
-		size += snprintf(buf, sizeof(buf), "%u\n", node->pid);
+		size += snprintf(str, sizeof(str), "%u\n", item->pid);
 	}
-	stbuf->st_mode = S_IFREG | 0444;
-	stbuf->st_nlink = 1;
-	stbuf->st_size = size;
-out_unlock:
 	pthread_spin_unlock(&lock);
 
-	return ret;
+	return size;
 }
 
 static int uproc_getattr(const char *path, struct stat *stbuf)
 {
-	char name[FILENAME_MAX];
-	int type;
-	key_t key;
+	struct namespace *ns;
 
 	memset(stbuf, 0, sizeof(*stbuf));
 
@@ -658,82 +676,56 @@ static int uproc_getattr(const char *path, struct stat *stbuf)
 		stbuf->st_nlink = 2;
 		return 0;
 	}
-	for_each_namespace(type) {
-		snprintf(name, sizeof(name), "/%s", ns[type].name);
-		if (!strncmp(path, name, sizeof(name))) {
-			stbuf->st_mode = S_IFDIR | 0555;
-			stbuf->st_nlink = 2;
+	for_each_namespace(ns) {
+		if (!strncmp(path + 1, ns->name, FILENAME_MAX)) {
+			stbuf->st_mode = S_IFREG | 0444;
+			stbuf->st_nlink = 1;
+			stbuf->st_size = namespace_size(ns);
 			return 0;
 		}
 	}
-	for_each_namespace(type) {
-		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
-		if (sscanf(path, name, &key) == 1)
-			return _getattr(type, key, stbuf);
-	}
-
 	return -ENOENT;
-}
-
-static int _open(enum key_type type, key_t key, struct fuse_file_info *fi)
-{
-	struct key_item *item;
-	int ret = 0;
-
-	pthread_spin_lock(&lock);
-	item = key_find_item(type, key);
-	if (unlikely(!item)) {
-		ret = -ENOENT;
-		goto out_unlock;
-	}
-	if ((fi->flags & 3) != O_RDONLY)
-		ret = -EACCES;
-out_unlock:
-	pthread_spin_unlock(&lock);
-
-	return ret;
 }
 
 static int uproc_open(const char *path, struct fuse_file_info *fi)
 {
-	char name[FILENAME_MAX];
-	int type, key;
+	struct namespace *ns;
 
-	for_each_namespace(type) {
-		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
-		if (sscanf(path, name, &key) == 1)
-			return _open(type, key, fi);
+	for_each_namespace(ns) {
+		if (!strncmp(path + 1, ns->name, FILENAME_MAX)) {
+			if ((fi->flags & 3) != O_RDONLY)
+				return -EACCES;
+			else
+				return 0;
+		}
 	}
 	return -ENOENT;
 }
 
-static int _read(enum key_type type, key_t key, char *buf, size_t size,
+static int _uproc_read(const struct namespace *ns, char *buf, size_t size,
 			off_t offset, struct fuse_file_info *fi)
 {
-	struct key_item *item;
-	struct key_item_node *node;
-	int len;
+	const struct hlist_node *n;
+	const struct pid_item *item;
+	int len, i;
 	int ret = 0;
 
-	if (unlikely(!size))
-		return 0;
-
 	pthread_spin_lock(&lock);
-	item = key_find_item(type, key);
-	if (unlikely(!item)) {
-		ret = -ENOENT;
-		goto out_unlock;
-	}
-	list_for_each_entry(node, &item->list, node) {
-		len = min(snprintf(buf, size, "%u\n", node->pid), size);
+	for_each_namespace_pid(ns, item, i, n) {
+		len = min(snprintf(buf, size, "%u\n", item->pid), size);
 
 		buf += len;
 		size -= len;
 		ret += len;
+
+		/*
+		 * NOTE: we can't use break here, for_each_namespace_pid() is a
+		 * macro with multiple nested loops.
+		 */
 		if (!size)
-			break;
+			goto out;
 	}
-out_unlock:
+out:
 	pthread_spin_unlock(&lock);
 
 	return ret;
@@ -742,15 +734,13 @@ out_unlock:
 static int uproc_read(const char *path, char *buf, size_t size,
 			off_t offset, struct fuse_file_info *fi)
 {
-	char name[FILENAME_MAX];
-	int type, key;
+	struct namespace *ns;
 
-	for_each_namespace(type) {
-		snprintf(name, sizeof(name), "/%s/%%d", ns[type].name);
-		if (sscanf(path, name, &key) == 1)
-			return _read(type, key, buf, size, offset, fi);
-	}
-
+	if (unlikely(!size))
+		return 0;
+	for_each_namespace(ns)
+		if (!strncmp(path + 1, ns->name, FILENAME_MAX))
+			return _uproc_read(ns, buf, size, offset, fi);
 	return -ENOENT;
 }
 
@@ -793,6 +783,18 @@ static int scan_procfs(void)
  */
 static void *uproc_init(struct fuse_conn_info *conn)
 {
+	int ret;
+
+	if (uproc_conf.config_file == NULL) {
+		/* NOTE: this is free()'d in uproc_free_config() */
+		uproc_conf.config_file = strdup(DEFAULT_CONFIG_FILE);
+	}
+	ret = read_config(uproc_conf.config_file);
+	if (ret < 0) {
+		kill(getpid(), SIGHUP);
+		return NULL;
+	}
+
 	pthread_spin_init(&lock, 0);
 	if (pthread_create(&proc_listener_thr, NULL, proc_listener, NULL) < 0) {
 		perror("pthread_create");
@@ -806,19 +808,20 @@ static void *uproc_init(struct fuse_conn_info *conn)
 /* Cleanup routine when uproc is unmounted */
 static void uproc_destory(void *unused)
 {
-	int type;
+	struct namespace *ns, *ns2;
 
 	need_exit = true;
 	pthread_join(proc_listener_thr, NULL);
 
 	pthread_spin_destroy(&lock);
 
-	for_each_namespace(type) {
-		key_cleanup(type);
-		pid_cleanup(type);
-	}
+	for_each_namespace(ns)
+		pid_cleanup_items(ns);
+	for_each_namespace_safe(ns, ns2)
+		namespace_del(ns);
 }
 
+/* FUSE filesystem declaration */
 static struct fuse_operations uproc_fs = {
 	.readdir	= uproc_readdir,
 	.getattr	= uproc_getattr,
@@ -828,7 +831,54 @@ static struct fuse_operations uproc_fs = {
 	.destroy	= uproc_destory,
 };
 
+static void uproc_usage(const char *progname)
+{
+	fprintf(stderr,
+"usage: %s mountpoint [options]\n"
+"\n"
+"general options:\n"
+"    -o opt,[opt...]        mount options\n"
+"    -h   --help            print help\n"
+"    -V   --version         print version\n"
+"\n"
+"uprocfs options:\n"
+"    -o config_file=FILE    specifies alternative configuration file\n"
+"\n", progname);
+}
+
+static int uproc_fuse_main(struct fuse_args *args)
+{
+	return fuse_main(args->argc, args->argv, &uproc_fs, NULL);
+}
+
+static int uproc_opt_proc(void *data, const char *arg, int key,
+				struct fuse_args *outargs)
+{
+	switch (key) {
+	case KEY_HELP:
+		uproc_usage(outargs->argv[0]);
+		fuse_opt_add_arg(outargs, "-ho");
+		uproc_fuse_main(outargs);
+		exit(EXIT_FAILURE);
+
+	case KEY_VERSION:
+		fprintf(stderr, "uprocfs version %s\n", UPROCFS_VERSION);
+		fuse_opt_add_arg(outargs, "--version");
+		uproc_fuse_main(outargs);
+		exit(EXIT_SUCCESS);
+	}
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
-	return fuse_main(argc, argv, &uproc_fs, NULL);
+	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+	int ret;
+
+	fuse_opt_parse(&args, &uproc_conf, uproc_opts, uproc_opt_proc);
+	ret = uproc_fuse_main(&args);
+	fuse_opt_free_args(&args);
+	uproc_free_config(&uproc_conf);
+
+	return ret;
 }
