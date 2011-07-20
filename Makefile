@@ -1,10 +1,12 @@
+VERSION=0.1
+
 TOPDIR=$(shell /bin/pwd)
 TARGET=uproc
 OBJS=src/uproc.o
 CFLAGS=-g -O2 -Wall `pkg-config fuse --cflags` -I$(TOPDIR)/include
 LDFLAGS=`pkg-config fuse --libs`
 
-CFLAGS+=-DPAGE_SIZE=$(shell getconf PAGE_SIZE) -DCACHELINE_SIZE=$(shell getconf LEVEL1_DCACHE_LINESIZE)
+CFLAGS+=-DPAGE_SIZE=$(shell getconf PAGE_SIZE) -DCACHELINE_SIZE=$(shell getconf LEVEL1_DCACHE_LINESIZE) -DVERSION=$(VERSION)
 
 ifeq ($(V),1)
   Q =
