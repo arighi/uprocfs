@@ -10,65 +10,78 @@ informations without scanning all the files under /proc.
 uprocfs is designed to be ultra-super-fast to retrieve specific informations,
 compared to the standard procfs interface.
 
-Usage
-~~~~~
- - mount uproc filesystem to /uproc:
-   # ./uproc /urpoc
-
-See also:
-   # ./uproc --help
-
 Design
 ~~~~~~
 The basic idea is to provide a facility to implement different views of the
-procfs based on uid and gid.
+proc filesystem, grouping PIDs by generic rules and associating them to
+different PID namespaces.
 
 The hierarchy of uprocfs might look as follows:
 
                      uprocfs
                         |
                         v
-            _________________________
-           |                         |
-           v                         v
-          uid                       gid
-           |                         |
-           v                         v
-      ________________           ________________
-     |     |     ...  |         |     |     ...  |
-     v     v          v         v     v          v
-     uid1  uid2       uidN      gid1  gid2       gidM
-     |  |                       |  |
-     v  v                       v  v
-   pid1 pid2 ...              pid1 pid2 ...
+                  ________________
+                 |     |    ...   |
+                 v     v          v
+                ns1  ns2        nsN
+               |  |
+               v  v
+             pid1 pid2 ...
 
-Different views of the proc filesystem are represented as directories in the
-root of the uproc filesystem.
+Where:
+  - ns1, ns2, ...: are the different PID namespaces
+  - pid1, pid2, ...: are the PIDs that run inside the different PID namespaces
 
-Elements of each view are represented as files.
-
-Looking at the diagram below:
-  - uid, gid: are represented as directories
-  - uid1 ... uidN, gid1 ... gidM: are represented as files
-  - pid1, pid2, ...: are represented as the content of the file they refer
+PID namespaces are represented as regular files inside uprocfs. Each
+namespace's file contains the list of PIDs that run inside the namespace.
 
 A userspace daemon, called uproc, listens to all kernel events that involve
 creation, exit, UID/GID change of any process in the system and stores all
 these informations to internal data structures, that are designed to speed up
 specific interrogations to the filesystem.
 
-Then, it exports different procfs views to the external applications using a
-FUSE filesystem (http://fuse.sourceforge.net/).
+The user can define custom rules to create different PID namespaces inside
+uprocfs.
+
+A configuration file must be passed to the uproc daemon; the configuration file
+contains all the generic rules (at the moment based only on the UID or GID of
+the tasks) to associate PIDs to different namespaces.
+
+Then, the daemon exports different the different namespaces to the external
+applications using a FUSE filesystem (http://fuse.sourceforge.net/).
+
+Usage
+~~~~~
+ - create a configuration file (i.e, in /etc/uproc.conf), for example:
+   $ cat /etc/uproc.conf
+   uid 1000 my_username
+   gid 34 backup
+
+ - mount uproc filesystem to /uproc:
+   # ./uproc -o config_file=/etc/uproc.conf /urpoc
+
+This will create two different namespaces, that are represented as regular
+files inside uprocfs:
+  /uproc/my_username
+  /uproc/backup
+
+The first one contains all the PIDs that run as UID 1000, the second file
+contains all the PIDs that run as GID 34.
+
+See also:
+   # ./uproc --help
 
 Performance results
 ~~~~~~~~~~~~~~~~~~~
-
 Following is reported a simple test that was used to measure the advantages of
 using the uproc interface respect to the classic procps interface.
 
 Test case:
  - UID 1000 create 10K tasks:
    $ for i in `seq 1 10000`; do sleep 10000 & done
+
+ - see etc/uproc.conf for the uprocfs configuration file used in this test
 
  - select all the PIDs of UID 1000:
 
@@ -92,7 +105,7 @@ Test case:
 
    - with uprocfs:
 
-     # time wc -l < /uproc/uid/1000 
+     # time wc -l < /uproc/righiandr
      10057
 
      real	0m0.015s
@@ -127,18 +140,20 @@ Examples
 ~~~~~~~~
 NOTE: all the following examples assume uprocfs is mounted on /uproc.
 
- - show all the running PIDs of UID 1000:
+The configuration file used in this examples can be found in ./etc/uproc.conf.
 
-# cat /uproc/uid/1000
+ - show all the running PIDs of user "righiandr":
 
- - count the tasks of UID 1000:
+# cat /uproc/righiandr
 
-# wc -l < /uproc/uid/1000
+ - count the tasks of the user "righiandr":
+
+# wc -l < /uproc/righiandr
 55 /uproc/uid/1000
 
- - show all programs currently executed by UID 1000:
+ - show all programs currently executed by user "righiandr":
 
-# sort -u `cat /uproc/uid/1000 | sed 's:\(.*\):/proc/\1/comm:'`
+# sort -u `cat /uproc/righiandr | sed 's:\(.*\):/proc/\1/comm:'`
 bash
 dbus-daemon
 dbus-launch
@@ -166,15 +181,15 @@ ssh-agent
 syndaemon
 xterm
 
- - send a SIGTERM to all processes of UID 1000 (kill UID sessions):
+ - send a SIGTERM to all processes of user "righiandr" (kill all sessions):
 
-# kill `cat /uproc/uid/1000`
+# kill `cat /uproc/righiandr`
 
- - show all bytes read and written by UID 1000 from block devices:
+ - show all bytes read and written by "righiandr" from block devices:
 
-# echo `sed -ne "s/^read_bytes: //p" $(cat /uproc/uid/1000 | sed 's:\(.*\):/proc/\1/io:') | tr "\n" +`0 | bc -l
+# echo `sed -ne "s/^read_bytes: //p" $(cat /uproc/righiandr | sed 's:\(.*\):/proc/\1/io:') | tr "\n" +`0 | bc -l
 141639680
-# echo `sed -ne "s/^write_bytes: //p" $(cat /uproc/uid/1000 | sed 's:\(.*\):/proc/\1/io:') | tr "\n" +`0 | bc -l
+# echo `sed -ne "s/^write_bytes: //p" $(cat /uproc/righiandr | sed 's:\(.*\):/proc/\1/io:') | tr "\n" +`0 | bc -l
 4071424
 
 BUGS
@@ -188,11 +203,10 @@ The solution used to implement the uproc daemon involves few concerns:
 
 TODO
 ~~~~
- - provide a way to define different views of the procfs (not only
-   per-uid/per-gid), using a configuration file (i.e, based on task name, or
-   select processes only of a certain UID, etc.); this could be a way to
-   implement PID namespaces or to perform PID remapping (map some tasks to a
-   different range of PIDs in uprocfs)
+ - provide a way to define rules to create PID namespaces (i.e., based on the
+   task command line)
 
  - consider to use an alternative way to report proc events to userspace (stop
    using netlink and maybe introduce a dedicate support in the kernel)
+
+ - re-read the configuration file at runtime without remounting uprocfs
