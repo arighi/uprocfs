@@ -82,7 +82,7 @@ typedef struct __attribute__ ((aligned(NLMSG_ALIGNTO))) {
 static pthread_t proc_listener_thr;
 
 /* Protect all namespaces hash lists */
-static pthread_spinlock_t lock;
+static pthread_rwlock_t lock;
 
 /* Used to stop the proc listener thread */
 static volatile bool need_exit;
@@ -214,6 +214,10 @@ static void pid_cleanup_items(struct namespace *ns)
 	struct pid_item *item;
 	int i;
 
+	/*
+	 * Do not care too much about locking here, at this point there must be
+	 * no reference to the namespace.
+	 */
 	for_each_namespace_pid_safe(ns, item, i, n, p) {
 		hlist_del(&item->hlist);
 		free(item);
@@ -280,14 +284,14 @@ static void pid_key_add(pid_t pid)
 
 	if (get_uid_gid_from_procfs(pid, &uid, &gid) < 0)
 		return;
-	pthread_spin_lock(&lock);
+	pthread_rwlock_wrlock(&lock);
 	for_each_namespace(ns) {
 		if (ns->type == TYPE_UID && ns->key == uid)
 			pid_add(TYPE_UID, uid, pid);
 		if (ns->type == TYPE_GID && ns->key == gid)
 			pid_add(TYPE_GID, gid, pid);
 	}
-	pthread_spin_unlock(&lock);
+	pthread_rwlock_unlock(&lock);
 }
 
 /*
@@ -298,7 +302,7 @@ static void pid_key_remove(pid_t pid)
 	struct namespace *ns;
 	struct pid_item *item;
 
-	pthread_spin_lock(&lock);
+	pthread_rwlock_wrlock(&lock);
 	for_each_namespace(ns) {
 		item = pid_find_item(ns, pid);
 		if (item) {
@@ -306,7 +310,7 @@ static void pid_key_remove(pid_t pid)
 			free(item);
 		}
 	}
-	pthread_spin_unlock(&lock);
+	pthread_rwlock_unlock(&lock);
 }
 
 /*
@@ -654,13 +658,13 @@ static size_t namespace_size(const struct namespace *ns)
 	size_t size = 0;
 	int i;
 
-	pthread_spin_lock(&lock);
+	pthread_rwlock_rdlock(&lock);
 	for_each_namespace_pid(ns, item, i, n) {
 		char str[FILENAME_MAX];
 
 		size += snprintf(str, sizeof(str), "%u\n", item->pid);
 	}
-	pthread_spin_unlock(&lock);
+	pthread_rwlock_unlock(&lock);
 
 	return size;
 }
@@ -710,7 +714,7 @@ static int _uproc_read(const struct namespace *ns, char *buf, size_t size,
 	int len, i;
 	int ret = 0;
 
-	pthread_spin_lock(&lock);
+	pthread_rwlock_rdlock(&lock);
 	for_each_namespace_pid(ns, item, i, n) {
 		len = min(snprintf(buf, size, "%u\n", item->pid), size);
 
@@ -726,7 +730,7 @@ static int _uproc_read(const struct namespace *ns, char *buf, size_t size,
 			goto out;
 	}
 out:
-	pthread_spin_unlock(&lock);
+	pthread_rwlock_unlock(&lock);
 
 	return ret;
 }
@@ -795,7 +799,7 @@ static void *uproc_init(struct fuse_conn_info *conn)
 		return NULL;
 	}
 
-	pthread_spin_init(&lock, 0);
+	pthread_rwlock_init(&lock, NULL);
 	if (pthread_create(&proc_listener_thr, NULL, proc_listener, NULL) < 0) {
 		perror("pthread_create");
 		exit(EXIT_FAILURE);
@@ -813,7 +817,7 @@ static void uproc_destory(void *unused)
 	need_exit = true;
 	pthread_join(proc_listener_thr, NULL);
 
-	pthread_spin_destroy(&lock);
+	pthread_rwlock_destroy(&lock);
 
 	for_each_namespace(ns)
 		pid_cleanup_items(ns);
