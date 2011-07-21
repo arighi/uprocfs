@@ -163,7 +163,7 @@ static int namespace_add(enum key_type type, key_t key, const char *name)
 		return -ENOMEM;
 	}
 	for (i = 0; i < PROC_KEY_HASH_SIZE; i++)
-		INIT_HLIST_HEAD(ns->pid_list);
+		INIT_HLIST_HEAD(&ns->pid_list[i]);
 	ns->type = type;
 	ns->key = key;
 	list_add_tail(&ns->node, &namespace);
