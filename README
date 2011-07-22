@@ -72,6 +72,24 @@ contains all the PIDs that run as GID 34.
 See also:
    # ./uproc --help
 
+Configuration
+~~~~~~~~~~~~~
+The configuration file can be auto-generated using the helper script
+tools/uproc-config.pl; for example:
+
+  $ ./tools/uproc-config.pl | sudo tee /etc/uproc.conf
+
+With this auto-generated configuration file, uproc will create a PID namespace
+for each UID and GID defined in the system.
+
+All namespaces are represented inside uprocfs in the following form:
+  uid.<username>
+  gid.<groupname>
+
+Where:
+   - <username> is the name of the user as reported in /etc/passwd
+   - <groupname> is the name of the group as reported in /etc/group
+
 Performance results
 ~~~~~~~~~~~~~~~~~~~
 Following is reported a simple test that was used to measure the advantages of
