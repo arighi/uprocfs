@@ -154,6 +154,14 @@ static int namespace_add(enum key_type type, key_t key, const char *name)
 	struct namespace *ns;
 	int i;
 
+	/* Santiy check: avoid duplicate namespaces */
+	for_each_namespace(ns) {
+		if (ns->type == type && ns->key == key)
+			return -EADDRINUSE;
+		if (!strncmp(ns->name, name, FILENAME_MAX))
+			return -EADDRINUSE;
+	}
+	/* Initialize and insert the new namespace */
 	ns = calloc(1, sizeof(*ns));
 	if (unlikely(!ns))
 		return -ENOMEM;
@@ -592,7 +600,7 @@ static int read_config(const char *file)
 			fprintf(stderr,
 				"ERROR: couldn't register namespace %s: %d\n",
 				name, ret);
-			return -ENOMEM;
+			return ret;
 		}
 	}
 	if (f != stdin)
