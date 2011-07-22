@@ -221,8 +221,8 @@ The solution used to implement the uproc daemon involves few concerns:
 
 TODO
 ~~~~
- - provide a way to define rules to create PID namespaces (i.e., based on the
-   task command line)
+ - allow to create PID namespaces based on the command line of the tasks (or
+   other task properties)
 
  - consider to use an alternative way to report proc events to userspace (stop
    using netlink and maybe introduce a dedicate support in the kernel)
