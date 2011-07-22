@@ -96,6 +96,12 @@ typedef int key_t;
 #define key_hashfn(__key) \
 		hash_long((unsigned long)__key, PROC_KEY_HASH_SHIFT)
 
+#define NS_KEY_HASH_SHIFT	10
+#define NS_KEY_HASH_SIZE	(1UL << NS_KEY_HASH_SHIFT)
+#define ns_hashfn(__ns) \
+		hash_long((unsigned long)((__ns)->type << 16 | (__ns->key)), \
+				NS_KEY_HASH_SHIFT)
+
 /* Used to store PID -> KEY mapping */
 struct pid_item {
 	struct hlist_node hlist;
@@ -111,21 +117,26 @@ enum key_type {
 /* Generic namespace definition */
 struct namespace {
 	struct hlist_head pid_list[PROC_KEY_HASH_SIZE];
-	struct list_head node;
+	struct hlist_node hlist;
 	char *name;
 	enum key_type type;
 	key_t key;
 };
 
 /* List of registered PID namespaces */
-static LIST_HEAD(namespace);
+static struct hlist_head namespace[NS_KEY_HASH_SIZE] = {
+	[0 ... NS_KEY_HASH_SIZE - 1] = HLIST_HEAD_INIT,
+};
 
 /* Namespace iterators */
-#define for_each_namespace(__ns)					\
-	list_for_each_entry(__ns, &namespace, node)
+#define for_each_namespace(__ns, __i, __n)				\
+	for (__i = 0; __i < NS_KEY_HASH_SIZE; __i++)			\
+		hlist_for_each_entry(__ns, __n,	&namespace[__i], hlist)
 
-#define for_each_namespace_safe(__ns, __ns2)				\
-	list_for_each_entry_safe(__ns, __ns2, &namespace, node)
+#define for_each_namespace_safe(__ns, __i, __n, __p)			\
+	for (__i = 0; __i < NS_KEY_HASH_SIZE; __i++)			\
+		hlist_for_each_entry_safe(__ns, __n, __p,		\
+					&namespace[__i], hlist)
 
 #define for_each_namespace_pid(__ns, __item, __i, __n)			\
 	for (__i = 0; __i < PROC_KEY_HASH_SIZE; __i++)			\
@@ -141,8 +152,10 @@ static LIST_HEAD(namespace);
 static struct namespace *namespace_find(enum key_type type, key_t key)
 {
 	struct namespace *ns;
+	struct hlist_node *n;
+	int i;
 
-	for_each_namespace(ns)
+	for_each_namespace(ns, i, n)
 		if (ns->type == type && ns->key == key)
 			return ns;
 	return NULL;
@@ -152,10 +165,11 @@ static struct namespace *namespace_find(enum key_type type, key_t key)
 static int namespace_add(enum key_type type, key_t key, const char *name)
 {
 	struct namespace *ns;
+	struct hlist_node *n;
 	int i;
 
 	/* Santiy check: avoid duplicate namespaces */
-	for_each_namespace(ns) {
+	for_each_namespace(ns, i, n) {
 		if (ns->type == type && ns->key == key)
 			return -EADDRINUSE;
 		if (!strncmp(ns->name, name, FILENAME_MAX))
@@ -174,7 +188,7 @@ static int namespace_add(enum key_type type, key_t key, const char *name)
 		INIT_HLIST_HEAD(&ns->pid_list[i]);
 	ns->type = type;
 	ns->key = key;
-	list_add_tail(&ns->node, &namespace);
+	hlist_add_head(&ns->hlist, &namespace[ns_hashfn(ns)]);
 
 	return 0;
 }
@@ -182,7 +196,7 @@ static int namespace_add(enum key_type type, key_t key, const char *name)
 /* Remove a namespace rule */
 static void namespace_del(struct namespace *ns)
 {
-	list_del(&ns->node);
+	hlist_del(&ns->hlist);
 	free(ns->name);
 	free(ns);
 }
@@ -287,13 +301,15 @@ static int get_uid_gid_from_procfs(pid_t pid, uid_t *euid, gid_t *egid)
 static void pid_key_add(pid_t pid)
 {
 	struct namespace *ns;
+	struct hlist_node *n;
+	int i;
 	uid_t uid;
 	gid_t gid;
 
 	if (get_uid_gid_from_procfs(pid, &uid, &gid) < 0)
 		return;
 	pthread_rwlock_wrlock(&lock);
-	for_each_namespace(ns) {
+	for_each_namespace(ns, i, n) {
 		if (ns->type == TYPE_UID && ns->key == uid)
 			pid_add(TYPE_UID, uid, pid);
 		if (ns->type == TYPE_GID && ns->key == gid)
@@ -308,10 +324,12 @@ static void pid_key_add(pid_t pid)
 static void pid_key_remove(pid_t pid)
 {
 	struct namespace *ns;
+	struct hlist_node *n;
+	int i;
 	struct pid_item *item;
 
 	pthread_rwlock_wrlock(&lock);
-	for_each_namespace(ns) {
+	for_each_namespace(ns, i, n) {
 		item = pid_find_item(ns, pid);
 		if (item) {
 			hlist_del(&item->hlist);
@@ -646,9 +664,11 @@ static int uproc_readdir(const char *path, void *buf,
 				off_t offset, struct fuse_file_info *fi)
 {
 	struct namespace *ns;
+	struct hlist_node *n;
+	int i;
 
 	if (!strcmp(path, "/")) {
-		for_each_namespace(ns)
+		for_each_namespace(ns, i, n)
 			filler(buf, ns->name, NULL, 0);
 		return 0;
 	}
@@ -680,6 +700,8 @@ static size_t namespace_size(const struct namespace *ns)
 static int uproc_getattr(const char *path, struct stat *stbuf)
 {
 	struct namespace *ns;
+	struct hlist_node *n;
+	int i;
 
 	memset(stbuf, 0, sizeof(*stbuf));
 
@@ -688,7 +710,7 @@ static int uproc_getattr(const char *path, struct stat *stbuf)
 		stbuf->st_nlink = 2;
 		return 0;
 	}
-	for_each_namespace(ns) {
+	for_each_namespace(ns, i, n) {
 		if (!strncmp(path + 1, ns->name, FILENAME_MAX)) {
 			stbuf->st_mode = S_IFREG | 0444;
 			stbuf->st_nlink = 1;
@@ -702,8 +724,10 @@ static int uproc_getattr(const char *path, struct stat *stbuf)
 static int uproc_open(const char *path, struct fuse_file_info *fi)
 {
 	struct namespace *ns;
+	struct hlist_node *n;
+	int i;
 
-	for_each_namespace(ns) {
+	for_each_namespace(ns, i, n) {
 		if (!strncmp(path + 1, ns->name, FILENAME_MAX)) {
 			if ((fi->flags & 3) != O_RDONLY)
 				return -EACCES;
@@ -747,10 +771,12 @@ static int uproc_read(const char *path, char *buf, size_t size,
 			off_t offset, struct fuse_file_info *fi)
 {
 	struct namespace *ns;
+	struct hlist_node *n;
+	int i;
 
 	if (unlikely(!size))
 		return 0;
-	for_each_namespace(ns)
+	for_each_namespace(ns, i, n)
 		if (!strncmp(path + 1, ns->name, FILENAME_MAX))
 			return _uproc_read(ns, buf, size, offset, fi);
 	return -ENOENT;
@@ -820,16 +846,18 @@ static void *uproc_init(struct fuse_conn_info *conn)
 /* Cleanup routine when uproc is unmounted */
 static void uproc_destory(void *unused)
 {
-	struct namespace *ns, *ns2;
+	struct namespace *ns;
+	struct hlist_node *n, *p;
+	int i;
 
 	need_exit = true;
 	pthread_join(proc_listener_thr, NULL);
 
 	pthread_rwlock_destroy(&lock);
 
-	for_each_namespace(ns)
+	for_each_namespace(ns, i, n)
 		pid_cleanup_items(ns);
-	for_each_namespace_safe(ns, ns2)
+	for_each_namespace_safe(ns, i, n, p)
 		namespace_del(ns);
 }
 
