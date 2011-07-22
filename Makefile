@@ -1,4 +1,4 @@
-VERSION=0.1
+VERSION=0.2
 
 TOPDIR=$(shell /bin/pwd)
 TARGET=uproc
