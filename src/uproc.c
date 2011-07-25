@@ -34,6 +34,7 @@
 
 #include "list.h"
 
+#include <assert.h>
 #include <ctype.h>
 #include <fuse.h>
 #include <pthread.h>
@@ -88,19 +89,17 @@ static pthread_rwlock_t lock;
 static volatile bool need_exit;
 
 /* Generic key type to identify the value of a PID property */
-typedef int key_t;
+typedef union {
+	int number;
+	char *string;
+} uproc_key_t;
 
 /* Internal hash structures */
 #define PROC_KEY_HASH_SHIFT	10
 #define PROC_KEY_HASH_SIZE	(1UL << PROC_KEY_HASH_SHIFT)
-#define key_hashfn(__key) \
-		hash_long((unsigned long)__key, PROC_KEY_HASH_SHIFT)
 
 #define NS_KEY_HASH_SHIFT	10
 #define NS_KEY_HASH_SIZE	(1UL << NS_KEY_HASH_SHIFT)
-#define ns_hashfn(__ns) \
-		hash_long((unsigned long)((__ns)->type << 16 | (__ns->key)), \
-				NS_KEY_HASH_SHIFT)
 
 /* Used to store PID -> KEY mapping */
 struct pid_item {
@@ -112,6 +111,7 @@ struct pid_item {
 enum key_type {
 	TYPE_UID = 0,
 	TYPE_GID,
+	TYPE_COMM,
 };
 
 /* Generic namespace definition */
@@ -120,8 +120,28 @@ struct namespace {
 	struct hlist_node hlist;
 	char *name;
 	enum key_type type;
-	key_t key;
+	uproc_key_t key;
 };
+
+static inline unsigned long pid_hashfn(pid_t pid)
+{
+	return hash_long((unsigned long)pid, PROC_KEY_HASH_SHIFT);
+}
+
+static inline unsigned long ns_hashfn(struct namespace *ns)
+{
+	switch (ns->type) {
+	case TYPE_UID:
+	case TYPE_GID:
+		return hash_long((unsigned long)(ns->type << 16 |
+					ns->key.number), NS_KEY_HASH_SHIFT);
+	case TYPE_COMM:
+		return hash_long((unsigned long)ns->key.string,
+					NS_KEY_HASH_SHIFT);
+	default:
+		assert(0);
+	}
+}
 
 /* List of registered PID namespaces */
 static struct hlist_head namespace[NS_KEY_HASH_SIZE] = {
@@ -149,20 +169,28 @@ static struct hlist_head namespace[NS_KEY_HASH_SIZE] = {
 					&((__ns)->pid_list[i]), hlist)
 
 /* Find a namespace */
-static struct namespace *namespace_find(enum key_type type, key_t key)
+static struct namespace *namespace_find(enum key_type type, uproc_key_t key)
 {
 	struct namespace *ns;
 	struct hlist_node *n;
 	int i;
 
-	for_each_namespace(ns, i, n)
-		if (ns->type == type && ns->key == key)
-			return ns;
+	for_each_namespace(ns, i, n) {
+		if (ns->type != type)
+			continue;
+		if (ns->type == TYPE_COMM) {
+			if (!strncmp(ns->key.string, key.string, FILENAME_MAX))
+				return ns;
+		} else {
+			if (ns->key.number == key.number)
+				return ns;
+		}
+	}
 	return NULL;
 }
 
 /* Register a new namespace rule */
-static int namespace_add(enum key_type type, key_t key, const char *name)
+static int namespace_add(enum key_type type, uproc_key_t key, const char *name)
 {
 	struct namespace *ns;
 	struct hlist_node *n;
@@ -170,7 +198,7 @@ static int namespace_add(enum key_type type, key_t key, const char *name)
 
 	/* Santiy check: avoid duplicate namespaces */
 	for_each_namespace(ns, i, n) {
-		if (ns->type == type && ns->key == key)
+		if (ns->type == type && ns->key.number == key.number)
 			return -EADDRINUSE;
 		if (!strncmp(ns->name, name, FILENAME_MAX))
 			return -EADDRINUSE;
@@ -197,6 +225,8 @@ static int namespace_add(enum key_type type, key_t key, const char *name)
 static void namespace_del(struct namespace *ns)
 {
 	hlist_del(&ns->hlist);
+	if (ns->type == TYPE_COMM)
+		free(ns->key.string);
 	free(ns->name);
 	free(ns);
 }
@@ -208,7 +238,7 @@ static struct pid_item *pid_find_item(struct namespace *ns, pid_t pid)
 	struct pid_item *item;
 	struct hlist_node *n;
 
-	hlist_for_each_entry(item, n, &hash[key_hashfn(pid)], hlist)
+	hlist_for_each_entry(item, n, &hash[pid_hashfn(pid)], hlist)
 		if (item->pid == pid)
 			return item;
 	return NULL;
@@ -224,7 +254,7 @@ static struct pid_item *pid_add_item(struct namespace *ns, pid_t pid)
 	if (unlikely(!item))
 		return NULL;
 	item->pid = pid;
-	hlist_add_head(&item->hlist, &hash[key_hashfn(pid)]);
+	hlist_add_head(&item->hlist, &hash[pid_hashfn(pid)]);
 
 	return item;
 }
@@ -247,7 +277,7 @@ static void pid_cleanup_items(struct namespace *ns)
 }
 
 /* Add a PID item */
-static struct pid_item *pid_add(enum key_type type, key_t key, pid_t pid)
+static struct pid_item *pid_add(enum key_type type, uproc_key_t key, pid_t pid)
 {
 	struct namespace *ns = namespace_find(type, key);
 
@@ -257,17 +287,20 @@ static struct pid_item *pid_add(enum key_type type, key_t key, pid_t pid)
 }
 
 /*
- * Get process data (euid and egid) from /proc/<pid>/status file
+ * Get process data (euid, egid, command name) from /proc/<pid>/status file
  */
-static int get_uid_gid_from_procfs(pid_t pid, uid_t *euid, gid_t *egid)
+static int
+get_info_from_procfs(pid_t pid, uid_t *euid, gid_t *egid, char **name)
 {
 	FILE *f;
 	char path[FILENAME_MAX];
 	char buf[PAGE_SIZE];
 	uid_t ruid, suid, fsuid;
 	gid_t rgid, sgid, fsgid;
+	int len;
 	bool found_euid = false;
 	bool found_egid = false;
+	bool found_name = false;
 
 	sprintf(path, "/proc/%d/status", pid);
 	f = fopen(path, "re");
@@ -285,12 +318,20 @@ static int get_uid_gid_from_procfs(pid_t pid, uid_t *euid, gid_t *egid)
 					&rgid, egid, &sgid, &fsgid) != 4)
 				break;
 			found_egid = true;
+		} else if (!strncmp(buf, "Name:", 5)) {
+			len = strlen(buf);
+			if (buf[len - 1] == '\n')
+				buf[len - 1] = '\0';
+			*name = strdup(buf + strlen("Name:") + 1);
+			if (*name == NULL)
+				return -ENOMEM;
+			found_name = true;
 		}
-		if (found_euid && found_egid)
+		if (found_euid && found_egid && found_name)
 			break;
 	}
 	fclose(f);
-	if (!found_euid || !found_egid)
+	if (!found_euid || !found_egid || !found_name)
 		return -EINVAL;
 	return 0;
 }
@@ -305,17 +346,23 @@ static void pid_key_add(pid_t pid)
 	int i;
 	uid_t uid;
 	gid_t gid;
+	char *name = NULL;
 
-	if (get_uid_gid_from_procfs(pid, &uid, &gid) < 0)
-		return;
+	if (get_info_from_procfs(pid, &uid, &gid, &name) < 0)
+		goto out;
 	pthread_rwlock_wrlock(&lock);
 	for_each_namespace(ns, i, n) {
-		if (ns->type == TYPE_UID && ns->key == uid)
-			pid_add(TYPE_UID, uid, pid);
-		if (ns->type == TYPE_GID && ns->key == gid)
-			pid_add(TYPE_GID, gid, pid);
+		if (ns->type == TYPE_UID && ns->key.number == uid)
+			pid_add(TYPE_UID, ns->key, pid);
+		if (ns->type == TYPE_GID && ns->key.number == gid)
+			pid_add(TYPE_GID, ns->key, pid);
+		if (ns->type == TYPE_COMM &&
+				!(strncmp(ns->key.string, name, FILENAME_MAX)))
+			pid_add(TYPE_COMM, ns->key, pid);
 	}
 	pthread_rwlock_unlock(&lock);
+out:
+	free(name);
 }
 
 /*
@@ -433,6 +480,10 @@ static void handle_proc_ev(const struct cn_msg *cn_hdr)
 	case PROC_EVENT_UID:
 	case PROC_EVENT_GID:
 		pid = ev->event_data.id.process_pid;
+		pid_key_update(pid);
+		break;
+	case PROC_EVENT_EXEC:
+		pid = ev->event_data.exec.process_pid;
 		pid_key_update(pid);
 		break;
 	case PROC_EVENT_EXIT:
@@ -573,8 +624,9 @@ static int read_config(const char *file)
 	char line[PAGE_SIZE];
 	char type_str[FILENAME_MAX];
 	char name[FILENAME_MAX];
+	char value[FILENAME_MAX];
 	int type;
-	key_t key;
+	uproc_key_t key;
 	char *p;
 	FILE *f;
 	int line_no = 0;
@@ -598,7 +650,7 @@ static int read_config(const char *file)
 		if (is_empty_or_comment(p))
 			continue;
 
-		ret = sscanf(line, "%256s %u %256s", type_str, &key, name);
+		ret = sscanf(line, "%256s %256s %256s", type_str, value, name);
 		if (ret != 3) {
 			fprintf(stderr, "ERROR: syntax error at %s:%d\n",
 					file, line_no);
@@ -606,8 +658,13 @@ static int read_config(const char *file)
 		}
 		if (!strcmp(type_str, "uid")) {
 			type = TYPE_UID;
+			key.number = atoi(value);
 		} else if (!strcmp(type_str, "gid")) {
 			type = TYPE_GID;
+			key.number = atoi(value);
+		} else if (!strcmp(type_str, "cmd")) {
+			type = TYPE_COMM;
+			key.string = strdup(value);
 		} else {
 			fprintf(stderr, "ERROR: unknown type '%s' at %s:%d\n",
 					type_str, file, line_no);
