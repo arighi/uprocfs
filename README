@@ -37,44 +37,46 @@ PID namespaces are represented as regular files inside uprocfs. Each
 namespace's file contains the list of PIDs that run inside the namespace.
 
 A userspace daemon, called uproc, listens to all kernel events that involve
-creation, exit, UID/GID change of any process in the system and stores all
-these informations to internal data structures, that are designed to speed up
-specific interrogations to the filesystem.
+creation, exit, UID/GID/command name change of any process in the system and
+stores all these informations to internal data structures, that are designed to
+speed up specific interrogations to the filesystem.
 
 The user can define custom rules to create different PID namespaces inside
 uprocfs.
 
 A configuration file must be passed to the uproc daemon; the configuration file
-contains all the generic rules (at the moment based only on the UID or GID of
-the tasks) to associate PIDs to different namespaces.
+contains all the generic rules (at the moment based on the UID, GID or command
+name of the tasks) to associate PIDs to different namespaces.
 
 Then, the daemon exports different the different namespaces to the external
 applications using a FUSE filesystem (http://fuse.sourceforge.net/).
 
-Usage
-~~~~~
- - create a configuration file (i.e, in /etc/uproc.conf), for example:
-   $ cat /etc/uproc.conf
-   uid 1000 my_username
-   gid 34 backup
-
- - mount uproc filesystem to /uproc:
-   # ./uproc -o config_file=/etc/uproc.conf /uproc
-
-This will create two different namespaces, that are represented as regular
-files inside uprocfs:
-  /uproc/my_username
-  /uproc/backup
-
-The first one contains all the PIDs that run as UID 1000, the second file
-contains all the PIDs that run as GID 34.
-
-See also:
-   # ./uproc --help
-
 Configuration
 ~~~~~~~~~~~~~
-The configuration file can be auto-generated using the helper script
+uproc uses /etc/uproc.conf as default configuration file.
+
+The configuration file contains a list of rules which assign a PID namespace to
+a defined group/user/command.
+
+Each rule is defined in the form:
+
+ <type> <key> <name>
+
+Where:
+
+   <type> can be:
+          - uid: select all tasks of a certain UID
+          - gid: select all tasks of a certain GID
+          - cmd: select all tasks that have a particular name
+
+   <key> is:
+          - the UID number if <type> is "uid"
+          - the GID number if <type> is "gid"
+          - the program name string if <type> is "cmd"
+
+   <name> is the name of the namespace
+
+A configuration file for starters can be auto-generated using the helper script
 tools/uproc-config.pl; for example:
 
   $ ./tools/uproc-config.pl | sudo tee /etc/uproc.conf
@@ -89,6 +91,30 @@ All namespaces are represented inside uprocfs in the following form:
 Where:
    - <username> is the name of the user as reported in /etc/passwd
    - <groupname> is the name of the group as reported in /etc/group
+
+Usage
+~~~~~
+ - create a configuration file (i.e, in /etc/uproc.conf), for example:
+   $ cat /etc/uproc.conf
+   uid 1000 my_username
+   gid 34 groups.backup
+   cmd tar software.backup
+
+ - mount uproc filesystem to /uproc:
+   # ./uproc -o allow_other /uproc
+
+This will create two different namespaces, that are represented as regular
+files inside uprocfs:
+  /uproc/my_username
+  /uproc/groups.backup
+  /uproc/software.tar
+
+The first one contains all the PIDs that run as UID 1000, the second file
+contains all the PIDs that run as GID 34, the third file contains all the
+"tar" commands that run on the system.
+
+See also:
+   # ./uproc --help
 
 Performance results
 ~~~~~~~~~~~~~~~~~~~
@@ -167,7 +193,7 @@ The configuration file used in this examples can be found in ./etc/uproc.conf.
  - count the tasks of the user "righiandr":
 
 # wc -l < /uproc/righiandr
-55 /uproc/uid/1000
+55 /uproc/righiandr
 
  - show all programs currently executed by user "righiandr":
 
