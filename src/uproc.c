@@ -95,8 +95,8 @@ typedef union {
 } uproc_key_t;
 
 /* Internal hash structures */
-#define PROC_KEY_HASH_SHIFT	10
-#define PROC_KEY_HASH_SIZE	(1UL << PROC_KEY_HASH_SHIFT)
+#define NS_PID_HASH_SHIFT	10
+#define NS_PID_HASH_SIZE	(1UL << NS_PID_HASH_SHIFT)
 
 #define NS_KEY_HASH_SHIFT	10
 #define NS_KEY_HASH_SIZE	(1UL << NS_KEY_HASH_SHIFT)
@@ -116,28 +116,27 @@ enum key_type {
 
 /* Generic namespace definition */
 struct namespace {
-	struct hlist_head pid_list[PROC_KEY_HASH_SIZE];
+	struct hlist_head pid_list[NS_PID_HASH_SIZE];
 	struct hlist_node hlist;
 	char *name;
-	enum key_type type;
 	uproc_key_t key;
+	enum key_type type;
 };
 
 static inline unsigned long pid_hashfn(pid_t pid)
 {
-	return hash_long((unsigned long)pid, PROC_KEY_HASH_SHIFT);
+	return hash_long((unsigned long)pid, NS_PID_HASH_SHIFT);
 }
 
-static inline unsigned long ns_hashfn(struct namespace *ns)
+static inline unsigned long ns_hashfn(enum key_type type, uproc_key_t key)
 {
-	switch (ns->type) {
+	switch (type) {
 	case TYPE_UID:
 	case TYPE_GID:
-		return hash_long((unsigned long)(ns->type << 16 |
-					ns->key.number), NS_KEY_HASH_SHIFT);
-	case TYPE_COMM:
-		return hash_long((unsigned long)ns->key.string,
+		return hash_long((unsigned long)(type << 16 | key.number),
 					NS_KEY_HASH_SHIFT);
+	case TYPE_COMM:
+		return hash_long((unsigned long)key.string, NS_KEY_HASH_SHIFT);
 	default:
 		assert(0);
 	}
@@ -159,26 +158,26 @@ static struct hlist_head namespace[NS_KEY_HASH_SIZE] = {
 					&namespace[__i], hlist)
 
 #define for_each_namespace_pid(__ns, __item, __i, __n)			\
-	for (__i = 0; __i < PROC_KEY_HASH_SIZE; __i++)			\
+	for (__i = 0; __i < NS_PID_HASH_SIZE; __i++)			\
 		hlist_for_each_entry(__item, __n,			\
 					&((__ns)->pid_list[__i]), hlist)
 
 #define for_each_namespace_pid_safe(__ns, __item, __i, __n, __p)	\
-	for (__i = 0; __i < PROC_KEY_HASH_SIZE; __i++)			\
+	for (__i = 0; __i < NS_PID_HASH_SIZE; __i++)			\
 		hlist_for_each_entry_safe(__item, __n, __p,		\
 					&((__ns)->pid_list[i]), hlist)
 
 /* Find a namespace */
 static struct namespace *namespace_find(enum key_type type, uproc_key_t key)
 {
+	const struct hlist_head *hash = namespace;
 	struct namespace *ns;
 	struct hlist_node *n;
-	int i;
 
-	for_each_namespace(ns, i, n) {
+	hlist_for_each_entry(ns, n, &hash[ns_hashfn(type, key)], hlist) {
 		if (ns->type != type)
 			continue;
-		if (ns->type == TYPE_COMM) {
+		if (type == TYPE_COMM) {
 			if (!strncmp(ns->key.string, key.string, FILENAME_MAX))
 				return ns;
 		} else {
@@ -193,16 +192,11 @@ static struct namespace *namespace_find(enum key_type type, uproc_key_t key)
 static int namespace_add(enum key_type type, uproc_key_t key, const char *name)
 {
 	struct namespace *ns;
-	struct hlist_node *n;
 	int i;
 
 	/* Santiy check: avoid duplicate namespaces */
-	for_each_namespace(ns, i, n) {
-		if (ns->type == type && ns->key.number == key.number)
-			return -EADDRINUSE;
-		if (!strncmp(ns->name, name, FILENAME_MAX))
-			return -EADDRINUSE;
-	}
+	if (namespace_find(type, key))
+		return -EADDRINUSE;
 	/* Initialize and insert the new namespace */
 	ns = calloc(1, sizeof(*ns));
 	if (unlikely(!ns))
@@ -212,11 +206,11 @@ static int namespace_add(enum key_type type, uproc_key_t key, const char *name)
 		free(ns);
 		return -ENOMEM;
 	}
-	for (i = 0; i < PROC_KEY_HASH_SIZE; i++)
+	for (i = 0; i < NS_PID_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&ns->pid_list[i]);
 	ns->type = type;
 	ns->key = key;
-	hlist_add_head(&ns->hlist, &namespace[ns_hashfn(ns)]);
+	hlist_add_head(&ns->hlist, &namespace[ns_hashfn(type, key)]);
 
 	return 0;
 }
@@ -276,16 +270,6 @@ static void pid_cleanup_items(struct namespace *ns)
 	}
 }
 
-/* Add a PID item */
-static struct pid_item *pid_add(enum key_type type, uproc_key_t key, pid_t pid)
-{
-	struct namespace *ns = namespace_find(type, key);
-
-	if (unlikely(!ns))
-		return NULL;
-	return pid_add_item(ns, pid);
-}
-
 /*
  * Get process data (euid, egid, command name) from /proc/<pid>/status file
  */
@@ -342,8 +326,7 @@ get_info_from_procfs(pid_t pid, uid_t *euid, gid_t *egid, char **name)
 static void pid_key_add(pid_t pid)
 {
 	struct namespace *ns;
-	struct hlist_node *n;
-	int i;
+	uproc_key_t key;
 	uid_t uid;
 	gid_t gid;
 	char *name = NULL;
@@ -351,15 +334,18 @@ static void pid_key_add(pid_t pid)
 	if (get_info_from_procfs(pid, &uid, &gid, &name) < 0)
 		goto out;
 	pthread_rwlock_wrlock(&lock);
-	for_each_namespace(ns, i, n) {
-		if (ns->type == TYPE_UID && ns->key.number == uid)
-			pid_add(TYPE_UID, ns->key, pid);
-		if (ns->type == TYPE_GID && ns->key.number == gid)
-			pid_add(TYPE_GID, ns->key, pid);
-		if (ns->type == TYPE_COMM &&
-				!(strncmp(ns->key.string, name, FILENAME_MAX)))
-			pid_add(TYPE_COMM, ns->key, pid);
-	}
+	key.number = uid;
+	ns = namespace_find(TYPE_UID, key);
+	if (ns)
+		pid_add_item(ns, pid);
+	key.number = gid;
+	ns = namespace_find(TYPE_GID, key);
+	if (ns)
+		pid_add_item(ns, pid);
+	key.string = name;
+	ns = namespace_find(TYPE_COMM, key);
+	if (ns)
+		pid_add_item(ns, pid);
 	pthread_rwlock_unlock(&lock);
 out:
 	free(name);
