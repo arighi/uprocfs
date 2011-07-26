@@ -120,17 +120,35 @@ struct pid_item {
 /* Generic namespace definition */
 struct namespace {
 	struct hlist_head pid_list[NS_PID_HASH_SIZE];
-	struct hlist_node hlist;
+	struct hlist_node hlist_key;
+	struct hlist_node hlist_name;
 	char *name;
 	uproc_key_t key;
 };
+
+/* One-at-a-Time hash function */
+static unsigned int hash_string(const char *s, size_t bits)
+{
+	unsigned int hash = 0, i;
+
+	for (i = 0; *s && i < FILENAME_MAX; i++, s++) {
+		hash += *s;
+		hash += hash << 10;
+		hash ^= hash >> 6;
+	}
+	hash += hash << 3;
+	hash ^= hash >> 11;
+	hash += hash << 15;
+
+	return hash & ((1 << bits) - 1);
+}
 
 static inline unsigned long pid_hashfn(pid_t pid)
 {
 	return hash_long((unsigned long)pid, NS_PID_HASH_SHIFT);
 }
 
-static inline unsigned long ns_hashfn(uproc_key_t key)
+static inline unsigned long ns_hashfn_key(uproc_key_t key)
 {
 	switch (key.type) {
 	case TYPE_UID:
@@ -138,26 +156,34 @@ static inline unsigned long ns_hashfn(uproc_key_t key)
 		return hash_long((unsigned long)(key.type << 16 | key.number),
 					NS_KEY_HASH_SHIFT);
 	case TYPE_COMM:
-		return hash_long((unsigned long)key.string, NS_KEY_HASH_SHIFT);
+		return hash_string(key.string, NS_KEY_HASH_SHIFT);
 	default:
 		assert(0);
 	}
 }
 
-/* List of registered PID namespaces */
-static struct hlist_head namespace[NS_KEY_HASH_SIZE] = {
+static inline unsigned long ns_hashfn_name(const char *name)
+{
+	return hash_string(name, NS_KEY_HASH_SHIFT);
+}
+
+/* Lists of PID namespaces */
+static struct hlist_head namespace_key[NS_KEY_HASH_SIZE] = {
+	[0 ... NS_KEY_HASH_SIZE - 1] = HLIST_HEAD_INIT,
+};
+static struct hlist_head namespace_name[NS_KEY_HASH_SIZE] = {
 	[0 ... NS_KEY_HASH_SIZE - 1] = HLIST_HEAD_INIT,
 };
 
 /* Namespace iterators */
 #define for_each_namespace(__ns, __i, __n)				\
 	for (__i = 0; __i < NS_KEY_HASH_SIZE; __i++)			\
-		hlist_for_each_entry(__ns, __n,	&namespace[__i], hlist)
+		hlist_for_each_entry(__ns, __n,	&namespace_key[__i], hlist_key)
 
 #define for_each_namespace_safe(__ns, __i, __n, __p)			\
 	for (__i = 0; __i < NS_KEY_HASH_SIZE; __i++)			\
 		hlist_for_each_entry_safe(__ns, __n, __p,		\
-					&namespace[__i], hlist)
+					&namespace_key[__i], hlist_key)
 
 #define for_each_namespace_pid(__ns, __item, __i, __n)			\
 	for (__i = 0; __i < NS_PID_HASH_SIZE; __i++)			\
@@ -169,14 +195,14 @@ static struct hlist_head namespace[NS_KEY_HASH_SIZE] = {
 		hlist_for_each_entry_safe(__item, __n, __p,		\
 					&((__ns)->pid_list[i]), hlist)
 
-/* Find a namespace */
-static struct namespace *namespace_find(uproc_key_t key)
+/* Find a namespace by key */
+static struct namespace *namespace_find_key(uproc_key_t key)
 {
-	const struct hlist_head *hash = namespace;
+	const struct hlist_head *hash = namespace_key;
 	struct namespace *ns;
 	struct hlist_node *n;
 
-	hlist_for_each_entry(ns, n, &hash[ns_hashfn(key)], hlist) {
+	hlist_for_each_entry(ns, n, &hash[ns_hashfn_key(key)], hlist_key) {
 		if (ns->key.type != key.type)
 			continue;
 		if (key.type == TYPE_COMM) {
@@ -190,6 +216,19 @@ static struct namespace *namespace_find(uproc_key_t key)
 	return NULL;
 }
 
+/* Find a namespace by name */
+static struct namespace *namespace_find_name(const char *name)
+{
+	const struct hlist_head *hash = namespace_name;
+	struct namespace *ns;
+	struct hlist_node *n;
+
+	hlist_for_each_entry(ns, n, &hash[ns_hashfn_name(name)], hlist_name)
+		if (!strncmp(ns->name, name, FILENAME_MAX))
+			return ns;
+	return NULL;
+}
+
 /* Register a new namespace rule */
 static int namespace_add(uproc_key_t key, const char *name)
 {
@@ -197,7 +236,7 @@ static int namespace_add(uproc_key_t key, const char *name)
 	int i;
 
 	/* Santiy check: avoid duplicate namespaces */
-	if (namespace_find(key))
+	if (namespace_find_key(key))
 		return -EADDRINUSE;
 	/* Initialize and insert the new namespace */
 	ns = calloc(1, sizeof(*ns));
@@ -211,7 +250,8 @@ static int namespace_add(uproc_key_t key, const char *name)
 	for (i = 0; i < NS_PID_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&ns->pid_list[i]);
 	ns->key = key;
-	hlist_add_head(&ns->hlist, &namespace[ns_hashfn(key)]);
+	hlist_add_head(&ns->hlist_key, &namespace_key[ns_hashfn_key(key)]);
+	hlist_add_head(&ns->hlist_name, &namespace_name[ns_hashfn_name(name)]);
 
 	return 0;
 }
@@ -219,7 +259,8 @@ static int namespace_add(uproc_key_t key, const char *name)
 /* Remove a namespace rule */
 static void namespace_del(struct namespace *ns)
 {
-	hlist_del(&ns->hlist);
+	hlist_del(&ns->hlist_key);
+	hlist_del(&ns->hlist_name);
 	if (ns->key.type == TYPE_COMM)
 		free(ns->key.string);
 	free(ns->name);
@@ -337,17 +378,17 @@ static void pid_key_add(pid_t pid)
 	pthread_rwlock_wrlock(&lock);
 	key.type = TYPE_UID;
 	key.number = uid;
-	ns = namespace_find(key);
+	ns = namespace_find_key(key);
 	if (ns)
 		pid_add_item(ns, pid);
 	key.type = TYPE_GID;
 	key.number = gid;
-	ns = namespace_find(key);
+	ns = namespace_find_key(key);
 	if (ns)
 		pid_add_item(ns, pid);
 	key.type = TYPE_COMM;
 	key.string = name;
-	ns = namespace_find(key);
+	ns = namespace_find_key(key);
 	if (ns)
 		pid_add_item(ns, pid);
 	pthread_rwlock_unlock(&lock);
@@ -746,8 +787,6 @@ static size_t namespace_size(const struct namespace *ns)
 static int uproc_getattr(const char *path, struct stat *stbuf)
 {
 	struct namespace *ns;
-	struct hlist_node *n;
-	int i;
 
 	memset(stbuf, 0, sizeof(*stbuf));
 
@@ -756,13 +795,12 @@ static int uproc_getattr(const char *path, struct stat *stbuf)
 		stbuf->st_nlink = 2;
 		return 0;
 	}
-	for_each_namespace(ns, i, n) {
-		if (!strncmp(path + 1, ns->name, FILENAME_MAX)) {
-			stbuf->st_mode = S_IFREG | 0444;
-			stbuf->st_nlink = 1;
-			stbuf->st_size = namespace_size(ns);
-			return 0;
-		}
+	ns = namespace_find_name(path + 1);
+	if (ns) {
+		stbuf->st_mode = S_IFREG | 0444;
+		stbuf->st_nlink = 1;
+		stbuf->st_size = namespace_size(ns);
+		return 0;
 	}
 	return -ENOENT;
 }
@@ -770,16 +808,13 @@ static int uproc_getattr(const char *path, struct stat *stbuf)
 static int uproc_open(const char *path, struct fuse_file_info *fi)
 {
 	struct namespace *ns;
-	struct hlist_node *n;
-	int i;
 
-	for_each_namespace(ns, i, n) {
-		if (!strncmp(path + 1, ns->name, FILENAME_MAX)) {
-			if ((fi->flags & 3) != O_RDONLY)
-				return -EACCES;
-			else
-				return 0;
-		}
+	ns = namespace_find_name(path + 1);
+	if (ns) {
+		if ((fi->flags & 3) != O_RDONLY)
+			return -EACCES;
+		else
+			return 0;
 	}
 	return -ENOENT;
 }
@@ -817,14 +852,12 @@ static int uproc_read(const char *path, char *buf, size_t size,
 			off_t offset, struct fuse_file_info *fi)
 {
 	struct namespace *ns;
-	struct hlist_node *n;
-	int i;
 
 	if (unlikely(!size))
 		return 0;
-	for_each_namespace(ns, i, n)
-		if (!strncmp(path + 1, ns->name, FILENAME_MAX))
-			return _uproc_read(ns, buf, size, offset, fi);
+	ns = namespace_find_name(path + 1);
+	if (ns)
+		return _uproc_read(ns, buf, size, offset, fi);
 	return -ENOENT;
 }
 
