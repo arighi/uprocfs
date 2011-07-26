@@ -88,10 +88,20 @@ static pthread_rwlock_t lock;
 /* Used to stop the proc listener thread */
 static volatile bool need_exit;
 
+/* Type of namespace rule */
+enum key_type {
+	TYPE_UID = 0,
+	TYPE_GID,
+	TYPE_COMM,
+};
+
 /* Generic key type to identify the value of a PID property */
-typedef union {
-	int number;
-	char *string;
+typedef struct {
+	union {
+		int number;
+		char *string;
+	};
+	enum key_type type;
 } uproc_key_t;
 
 /* Internal hash structures */
@@ -107,20 +117,12 @@ struct pid_item {
 	pid_t pid;
 };
 
-/* Type of namespace rule */
-enum key_type {
-	TYPE_UID = 0,
-	TYPE_GID,
-	TYPE_COMM,
-};
-
 /* Generic namespace definition */
 struct namespace {
 	struct hlist_head pid_list[NS_PID_HASH_SIZE];
 	struct hlist_node hlist;
 	char *name;
 	uproc_key_t key;
-	enum key_type type;
 };
 
 static inline unsigned long pid_hashfn(pid_t pid)
@@ -128,12 +130,12 @@ static inline unsigned long pid_hashfn(pid_t pid)
 	return hash_long((unsigned long)pid, NS_PID_HASH_SHIFT);
 }
 
-static inline unsigned long ns_hashfn(enum key_type type, uproc_key_t key)
+static inline unsigned long ns_hashfn(uproc_key_t key)
 {
-	switch (type) {
+	switch (key.type) {
 	case TYPE_UID:
 	case TYPE_GID:
-		return hash_long((unsigned long)(type << 16 | key.number),
+		return hash_long((unsigned long)(key.type << 16 | key.number),
 					NS_KEY_HASH_SHIFT);
 	case TYPE_COMM:
 		return hash_long((unsigned long)key.string, NS_KEY_HASH_SHIFT);
@@ -168,16 +170,16 @@ static struct hlist_head namespace[NS_KEY_HASH_SIZE] = {
 					&((__ns)->pid_list[i]), hlist)
 
 /* Find a namespace */
-static struct namespace *namespace_find(enum key_type type, uproc_key_t key)
+static struct namespace *namespace_find(uproc_key_t key)
 {
 	const struct hlist_head *hash = namespace;
 	struct namespace *ns;
 	struct hlist_node *n;
 
-	hlist_for_each_entry(ns, n, &hash[ns_hashfn(type, key)], hlist) {
-		if (ns->type != type)
+	hlist_for_each_entry(ns, n, &hash[ns_hashfn(key)], hlist) {
+		if (ns->key.type != key.type)
 			continue;
-		if (type == TYPE_COMM) {
+		if (key.type == TYPE_COMM) {
 			if (!strncmp(ns->key.string, key.string, FILENAME_MAX))
 				return ns;
 		} else {
@@ -189,13 +191,13 @@ static struct namespace *namespace_find(enum key_type type, uproc_key_t key)
 }
 
 /* Register a new namespace rule */
-static int namespace_add(enum key_type type, uproc_key_t key, const char *name)
+static int namespace_add(uproc_key_t key, const char *name)
 {
 	struct namespace *ns;
 	int i;
 
 	/* Santiy check: avoid duplicate namespaces */
-	if (namespace_find(type, key))
+	if (namespace_find(key))
 		return -EADDRINUSE;
 	/* Initialize and insert the new namespace */
 	ns = calloc(1, sizeof(*ns));
@@ -208,9 +210,8 @@ static int namespace_add(enum key_type type, uproc_key_t key, const char *name)
 	}
 	for (i = 0; i < NS_PID_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&ns->pid_list[i]);
-	ns->type = type;
 	ns->key = key;
-	hlist_add_head(&ns->hlist, &namespace[ns_hashfn(type, key)]);
+	hlist_add_head(&ns->hlist, &namespace[ns_hashfn(key)]);
 
 	return 0;
 }
@@ -219,7 +220,7 @@ static int namespace_add(enum key_type type, uproc_key_t key, const char *name)
 static void namespace_del(struct namespace *ns)
 {
 	hlist_del(&ns->hlist);
-	if (ns->type == TYPE_COMM)
+	if (ns->key.type == TYPE_COMM)
 		free(ns->key.string);
 	free(ns->name);
 	free(ns);
@@ -334,16 +335,19 @@ static void pid_key_add(pid_t pid)
 	if (get_info_from_procfs(pid, &uid, &gid, &name) < 0)
 		goto out;
 	pthread_rwlock_wrlock(&lock);
+	key.type = TYPE_UID;
 	key.number = uid;
-	ns = namespace_find(TYPE_UID, key);
+	ns = namespace_find(key);
 	if (ns)
 		pid_add_item(ns, pid);
+	key.type = TYPE_GID;
 	key.number = gid;
-	ns = namespace_find(TYPE_GID, key);
+	ns = namespace_find(key);
 	if (ns)
 		pid_add_item(ns, pid);
+	key.type = TYPE_COMM;
 	key.string = name;
-	ns = namespace_find(TYPE_COMM, key);
+	ns = namespace_find(key);
 	if (ns)
 		pid_add_item(ns, pid);
 	pthread_rwlock_unlock(&lock);
@@ -611,7 +615,6 @@ static int read_config(const char *file)
 	char type_str[FILENAME_MAX];
 	char name[FILENAME_MAX];
 	char value[FILENAME_MAX];
-	int type;
 	uproc_key_t key;
 	char *p;
 	FILE *f;
@@ -643,20 +646,20 @@ static int read_config(const char *file)
 			return -EINVAL;
 		}
 		if (!strcmp(type_str, "uid")) {
-			type = TYPE_UID;
+			key.type = TYPE_UID;
 			key.number = atoi(value);
 		} else if (!strcmp(type_str, "gid")) {
-			type = TYPE_GID;
+			key.type = TYPE_GID;
 			key.number = atoi(value);
 		} else if (!strcmp(type_str, "cmd")) {
-			type = TYPE_COMM;
+			key.type = TYPE_COMM;
 			key.string = strdup(value);
 		} else {
 			fprintf(stderr, "ERROR: unknown type '%s' at %s:%d\n",
 					type_str, file, line_no);
 			return -EINVAL;
 		}
-		ret = namespace_add(type, key, name);
+		ret = namespace_add(key, name);
 		if (ret < 0) {
 			fprintf(stderr,
 				"ERROR: couldn't register namespace %s: %d\n",
