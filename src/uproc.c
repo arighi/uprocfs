@@ -105,9 +105,6 @@ typedef struct {
 } uproc_key_t;
 
 /* Internal hash structures */
-#define NS_PID_HASH_SHIFT	9
-#define NS_PID_HASH_SIZE	(1UL << NS_PID_HASH_SHIFT)
-
 #define NS_KEY_HASH_SHIFT	9
 #define NS_KEY_HASH_SIZE	(1UL << NS_KEY_HASH_SHIFT)
 
@@ -116,13 +113,13 @@ typedef struct {
 
 /* Used to store PID -> KEY mapping */
 struct pid_item {
-	struct hlist_node hlist;
+	struct list_head node;
 	pid_t pid;
 };
 
 /* Generic namespace definition */
 struct namespace {
-	struct hlist_head pid_list[NS_PID_HASH_SIZE];
+	struct list_head pid_list;
 	struct hlist_node hlist_key;
 	struct hlist_node hlist_name;
 	char *name;
@@ -143,11 +140,6 @@ static unsigned long hash_string(const char *key, size_t bits)
 	while (*key && i++ < FILENAME_MAX)
 		hash = *key++ + (hash << 6) + (hash << 16) - hash;
 	return hash & ((1 << bits) - 1);
-}
-
-static inline unsigned long pid_hashfn(pid_t pid)
-{
-	return hash_long((unsigned long)pid, NS_PID_HASH_SHIFT);
 }
 
 static inline unsigned long pid_map_hashfn(pid_t pid)
@@ -197,15 +189,12 @@ static struct hlist_head pid_map_list[PID_MAP_HASH_SIZE] = {
 		hlist_for_each_entry_safe(__ns, __n, __p,		\
 					&namespace_key[__i], hlist_key)
 
-#define for_each_namespace_pid(__ns, __item, __i, __n)			\
-	for (__i = 0; __i < NS_PID_HASH_SIZE; __i++)			\
-		hlist_for_each_entry(__item, __n,			\
-					&((__ns)->pid_list[__i]), hlist)
+#define for_each_namespace_pid(__ns, __item)				\
+	list_for_each_entry(__item, &((__ns)->pid_list), node)
 
-#define for_each_namespace_pid_safe(__ns, __item, __i, __n, __p)	\
-	for (__i = 0; __i < NS_PID_HASH_SIZE; __i++)			\
-		hlist_for_each_entry_safe(__item, __n, __p,		\
-					&((__ns)->pid_list[i]), hlist)
+#define for_each_namespace_pid_safe(__ns, __item, __p)			\
+		list_for_each_entry_safe(__item, __p,			\
+					&((__ns)->pid_list), node)
 
 /*
  * Map a PID to a list of namespace elements.
@@ -281,7 +270,7 @@ static void pid_map_del(pid_t pid)
 		return;
 	list_for_each_entry_safe(map_item, p, &map->list, node) {
 		item = map_item->item;
-		hlist_del(&item->hlist);
+		list_del(&item->node);
 		free(item);
 
 		list_del(&map_item->node);
@@ -329,7 +318,6 @@ static struct namespace *namespace_find_name(const char *name)
 static int namespace_add(uproc_key_t key, const char *name)
 {
 	struct namespace *ns;
-	int i;
 
 	/* Santiy check: avoid duplicate namespaces */
 	if (namespace_find_key(key))
@@ -343,8 +331,7 @@ static int namespace_add(uproc_key_t key, const char *name)
 		free(ns);
 		return -ENOMEM;
 	}
-	for (i = 0; i < NS_PID_HASH_SIZE; i++)
-		INIT_HLIST_HEAD(&ns->pid_list[i]);
+	INIT_LIST_HEAD(&ns->pid_list);
 	ns->key = key;
 	hlist_add_head(&ns->hlist_key, &namespace_key[ns_hashfn_key(key)]);
 	hlist_add_head(&ns->hlist_name, &namespace_name[ns_hashfn_name(name)]);
@@ -366,14 +353,13 @@ static void namespace_del(struct namespace *ns)
 /* Add a PID to a namespace */
 static struct pid_item *pid_add_item(struct namespace *ns, pid_t pid)
 {
-	struct hlist_head *hash = ns->pid_list;
 	struct pid_item *item;
 
 	item = malloc(sizeof(*item));
 	if (unlikely(!item))
 		return NULL;
 	item->pid = pid;
-	hlist_add_head(&item->hlist, &hash[pid_hashfn(pid)]);
+	list_add_tail(&item->node, &ns->pid_list);
 	pid_map_add(item);
 
 	return item;
@@ -382,15 +368,13 @@ static struct pid_item *pid_add_item(struct namespace *ns, pid_t pid)
 /* Remove all PIDs from a namespace */
 static void pid_cleanup_items(struct namespace *ns)
 {
-	struct hlist_node *n, *p;
-	struct pid_item *item;
-	int i;
+	struct pid_item *item, *p;
 
 	/*
 	 * Do not care too much about locking here, at this point there must be
 	 * no reference to the namespace.
 	 */
-	for_each_namespace_pid_safe(ns, item, i, n, p)
+	for_each_namespace_pid_safe(ns, item, p)
 		pid_map_del(item->pid);
 }
 
@@ -839,13 +823,11 @@ static int uproc_readdir(const char *path, void *buf,
  */
 static size_t namespace_size(const struct namespace *ns)
 {
-	const struct hlist_node *n;
 	const struct pid_item *item;
 	size_t size = 0;
-	int i;
 
 	pthread_rwlock_rdlock(&lock);
-	for_each_namespace_pid(ns, item, i, n) {
+	for_each_namespace_pid(ns, item) {
 		char str[FILENAME_MAX];
 
 		size += snprintf(str, sizeof(str), "%u\n", item->pid);
@@ -893,13 +875,12 @@ static int uproc_open(const char *path, struct fuse_file_info *fi)
 static int _uproc_read(const struct namespace *ns, char *buf, size_t size,
 			off_t offset, struct fuse_file_info *fi)
 {
-	const struct hlist_node *n;
 	const struct pid_item *item;
-	int len, i;
+	int len;
 	int ret = 0;
 
 	pthread_rwlock_rdlock(&lock);
-	for_each_namespace_pid(ns, item, i, n) {
+	for_each_namespace_pid(ns, item) {
 		len = min(snprintf(buf, size, "%u\n", item->pid), size);
 
 		buf += len;
