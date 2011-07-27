@@ -111,6 +111,9 @@ typedef struct {
 #define NS_KEY_HASH_SHIFT	9
 #define NS_KEY_HASH_SIZE	(1UL << NS_KEY_HASH_SHIFT)
 
+#define PID_MAP_HASH_SHIFT	9
+#define PID_MAP_HASH_SIZE	(1UL << PID_MAP_HASH_SHIFT)
+
 /* Used to store PID -> KEY mapping */
 struct pid_item {
 	struct hlist_node hlist;
@@ -147,6 +150,11 @@ static inline unsigned long pid_hashfn(pid_t pid)
 	return hash_long((unsigned long)pid, NS_PID_HASH_SHIFT);
 }
 
+static inline unsigned long pid_map_hashfn(pid_t pid)
+{
+	return hash_long((unsigned long)pid, PID_MAP_HASH_SHIFT);
+}
+
 static inline unsigned long ns_hashfn_key(uproc_key_t key)
 {
 	switch (key.type) {
@@ -166,12 +174,17 @@ static inline unsigned long ns_hashfn_name(const char *name)
 	return hash_string(name, NS_KEY_HASH_SHIFT);
 }
 
-/* Lists of PID namespaces */
+/* Hash list used to retrieve namespaces by key */
 static struct hlist_head namespace_key[NS_KEY_HASH_SIZE] = {
 	[0 ... NS_KEY_HASH_SIZE - 1] = HLIST_HEAD_INIT,
 };
+/* Hash list used to retrieve namespaces by name */
 static struct hlist_head namespace_name[NS_KEY_HASH_SIZE] = {
 	[0 ... NS_KEY_HASH_SIZE - 1] = HLIST_HEAD_INIT,
+};
+/* Hash list used to retrieve a namespace element by pid */
+static struct hlist_head pid_map_list[PID_MAP_HASH_SIZE] = {
+	[0 ... PID_MAP_HASH_SIZE - 1] = HLIST_HEAD_INIT,
 };
 
 /* Namespace iterators */
@@ -193,6 +206,90 @@ static struct hlist_head namespace_name[NS_KEY_HASH_SIZE] = {
 	for (__i = 0; __i < NS_PID_HASH_SIZE; __i++)			\
 		hlist_for_each_entry_safe(__item, __n, __p,		\
 					&((__ns)->pid_list[i]), hlist)
+
+/*
+ * Map a PID to a list of namespace elements.
+ *
+ * NOTE: a PID can be associated to many namespaces, and a namespace can have
+ * many PIDs.
+ */
+struct pid_map {
+	struct hlist_node hlist;
+	struct list_head list;
+	pid_t pid;
+};
+
+/*
+ * An element of the pid_map structure.
+ */
+struct pid_map_item {
+	struct list_head node;
+	struct pid_item *item;
+};
+
+/* Find the list of namespace elements associated to a PID */
+static struct pid_map *pid_map_find(pid_t pid)
+{
+	const struct hlist_head *hash = pid_map_list;
+	struct pid_map *map;
+	struct hlist_node *n;
+
+	hlist_for_each_entry(map, n, &hash[pid_map_hashfn(pid)], hlist) {
+		if (map->pid == pid)
+			return map;
+	}
+	return NULL;
+}
+
+/* Add a mapping between a PID and a namespace element */
+static int pid_map_add(struct pid_item *item)
+{
+	struct pid_map *map;
+	struct pid_map_item *map_item;
+	pid_t pid = item->pid;
+
+	map = pid_map_find(pid);
+	if (!map) {
+		map = calloc(1, sizeof(*map));
+		if (unlikely(!map))
+			return -ENOMEM;
+		map->pid = pid;
+		INIT_LIST_HEAD(&map->list);
+		hlist_add_head(&map->hlist, &pid_map_list[pid_map_hashfn(pid)]);
+	}
+	map_item = calloc(1, sizeof(*map_item));
+	if (unlikely(!map_item))
+		return -ENOMEM;
+	map_item->item = item;
+	list_add(&map_item->node, &map->list);
+
+	return 0;
+}
+
+/*
+ * Remove all the mappings among a PID and a list of namespace elements.
+ * This happens when a task exits and its PID is released.
+ */
+static void pid_map_del(pid_t pid)
+{
+	struct pid_map *map;
+	struct pid_map_item *map_item, *p;
+	struct pid_item *item;
+
+	map = pid_map_find(pid);
+	if (!map)
+		return;
+	list_for_each_entry_safe(map_item, p, &map->list, node) {
+		item = map_item->item;
+		hlist_del(&item->hlist);
+		free(item);
+
+		list_del(&map_item->node);
+		free(map_item);
+	}
+	hlist_del(&map->hlist);
+	free(map);
+}
 
 /* Find a namespace by key */
 static struct namespace *namespace_find_key(uproc_key_t key)
@@ -266,19 +363,6 @@ static void namespace_del(struct namespace *ns)
 	free(ns);
 }
 
-/* Find a PID item inside a namespace */
-static struct pid_item *pid_find_item(struct namespace *ns, pid_t pid)
-{
-	const struct hlist_head *hash = ns->pid_list;
-	struct pid_item *item;
-	struct hlist_node *n;
-
-	hlist_for_each_entry(item, n, &hash[pid_hashfn(pid)], hlist)
-		if (item->pid == pid)
-			return item;
-	return NULL;
-}
-
 /* Add a PID to a namespace */
 static struct pid_item *pid_add_item(struct namespace *ns, pid_t pid)
 {
@@ -290,6 +374,7 @@ static struct pid_item *pid_add_item(struct namespace *ns, pid_t pid)
 		return NULL;
 	item->pid = pid;
 	hlist_add_head(&item->hlist, &hash[pid_hashfn(pid)]);
+	pid_map_add(item);
 
 	return item;
 }
@@ -305,10 +390,8 @@ static void pid_cleanup_items(struct namespace *ns)
 	 * Do not care too much about locking here, at this point there must be
 	 * no reference to the namespace.
 	 */
-	for_each_namespace_pid_safe(ns, item, i, n, p) {
-		hlist_del(&item->hlist);
-		free(item);
-	}
+	for_each_namespace_pid_safe(ns, item, i, n, p)
+		pid_map_del(item->pid);
 }
 
 /*
@@ -400,19 +483,8 @@ out:
  */
 static void pid_key_remove(pid_t pid)
 {
-	struct namespace *ns;
-	struct hlist_node *n;
-	int i;
-	struct pid_item *item;
-
 	pthread_rwlock_wrlock(&lock);
-	for_each_namespace(ns, i, n) {
-		item = pid_find_item(ns, pid);
-		if (item) {
-			hlist_del(&item->hlist);
-			free(item);
-		}
-	}
+	pid_map_del(pid);
 	pthread_rwlock_unlock(&lock);
 }
 
@@ -834,14 +906,9 @@ static int _uproc_read(const struct namespace *ns, char *buf, size_t size,
 		size -= len;
 		ret += len;
 
-		/*
-		 * NOTE: we can't use break here, for_each_namespace_pid() is a
-		 * macro with multiple nested loops.
-		 */
 		if (!size)
-			goto out;
+			break;
 	}
-out:
 	pthread_rwlock_unlock(&lock);
 
 	return ret;
