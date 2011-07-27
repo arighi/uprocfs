@@ -197,7 +197,7 @@ The configuration file used in this examples can be found in ./etc/uproc.conf.
 
  - show all programs currently executed by user "righiandr":
 
-# sort -u `cat /uproc/righiandr | sed 's:\(.*\):/proc/\1/comm:'`
+# cat $(sed 's:.*:/proc/&/comm:' /uproc/righiandr) | sort -u
 bash
 dbus-daemon
 dbus-launch
@@ -231,9 +231,9 @@ xterm
 
  - show all bytes read and written by "righiandr" from block devices:
 
-# echo `sed -ne "s/^read_bytes: //p" $(cat /uproc/righiandr | sed 's:\(.*\):/proc/\1/io:') | tr "\n" +`0 | bc -l
+# echo `sed -ne "s/^read_bytes: //p" $(sed 's:.*:/proc/&/io:' /uproc/righiandr) | tr "\n" +`0 | bc -l
 141639680
-# echo `sed -ne "s/^write_bytes: //p" $(cat /uproc/righiandr | sed 's:\(.*\):/proc/\1/io:') | tr "\n" +`0 | bc -l
+# echo `sed -ne "s/^write_bytes: //p" $(sed 's:.*:/proc/&/io:' /uproc/righiandr) | tr "\n" +`0 | bc -l
 4071424
 
 BUGS
