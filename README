@@ -48,7 +48,7 @@ A configuration file must be passed to the uproc daemon; the configuration file
 contains all the generic rules (at the moment based on the UID, GID or command
 name of the tasks) to associate PIDs to different namespaces.
 
-Then, the daemon exports different the different namespaces to the external
+Then, the daemon exports the different namespaces to the external
 applications using a FUSE filesystem (http://fuse.sourceforge.net/).
 
 Configuration
