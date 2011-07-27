@@ -126,20 +126,19 @@ struct namespace {
 	uproc_key_t key;
 };
 
-/* One-at-a-Time hash function */
-static unsigned int hash_string(const char *s, size_t bits)
+/*
+ * Compute the hash value for the given string. The algorithm is an
+ * implementation of the sdbm database library [Selzer,Yigit].
+ *
+ * See also: http://www.cse.yorku.ca/~oz/hash.html
+ */
+static unsigned long hash_string(const char *key, size_t bits)
 {
-	unsigned int hash = 0, i;
+	unsigned long hash = 0;
+	int i = 0;
 
-	for (i = 0; *s && i < FILENAME_MAX; i++, s++) {
-		hash += *s;
-		hash += hash << 10;
-		hash ^= hash >> 6;
-	}
-	hash += hash << 3;
-	hash ^= hash >> 11;
-	hash += hash << 15;
-
+	while (*key && i++ < FILENAME_MAX)
+		hash = *key++ + (hash << 6) + (hash << 16) - hash;
 	return hash & ((1 << bits) - 1);
 }
 
