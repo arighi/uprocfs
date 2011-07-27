@@ -98,17 +98,17 @@ enum key_type {
 /* Generic key type to identify the value of a PID property */
 typedef struct {
 	union {
-		int number;
+		unsigned long number;
 		char *string;
 	};
 	enum key_type type;
 } uproc_key_t;
 
 /* Internal hash structures */
-#define NS_PID_HASH_SHIFT	10
+#define NS_PID_HASH_SHIFT	9
 #define NS_PID_HASH_SIZE	(1UL << NS_PID_HASH_SHIFT)
 
-#define NS_KEY_HASH_SHIFT	10
+#define NS_KEY_HASH_SHIFT	9
 #define NS_KEY_HASH_SIZE	(1UL << NS_KEY_HASH_SHIFT)
 
 /* Used to store PID -> KEY mapping */
