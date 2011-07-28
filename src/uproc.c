@@ -751,6 +751,12 @@ static int read_config(const char *file)
 		} else if (!strcmp(type_str, "cmd")) {
 			key.type = TYPE_COMM;
 			key.string = strdup(value);
+			if (!key.string) {
+				fprintf(stderr,
+					"ERROR: out of memory at %s:%d\n",
+					file, line_no);
+				return -ENOMEM;
+			}
 		} else {
 			fprintf(stderr, "ERROR: unknown type '%s' at %s:%d\n",
 					type_str, file, line_no);
@@ -953,6 +959,10 @@ static void *uproc_init(struct fuse_conn_info *conn)
 	if (uproc_conf.config_file == NULL) {
 		/* NOTE: this is free()'d in uproc_free_config() */
 		uproc_conf.config_file = strdup(DEFAULT_CONFIG_FILE);
+		if (!uproc_conf.config_file) {
+			kill(getpid(), SIGHUP);
+			return NULL;
+		}
 	}
 	ret = read_config(uproc_conf.config_file);
 	if (ret < 0) {
