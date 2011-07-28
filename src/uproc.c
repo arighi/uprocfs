@@ -99,8 +99,9 @@ enum key_type {
 /* Generic key type to identify the value of a PID property */
 typedef struct {
 	union {
-		unsigned long number;
-		char *string;
+		uid_t uid;
+		gid_t gid;
+		char *name;
 	};
 	enum key_type type;
 } uproc_key_t;
@@ -152,11 +153,13 @@ static inline unsigned long ns_hashfn_key(uproc_key_t key)
 {
 	switch (key.type) {
 	case TYPE_UID:
+		return hash_long((unsigned long)(TYPE_UID << 16 | key.uid),
+					NS_KEY_HASH_SHIFT);
 	case TYPE_GID:
-		return hash_long((unsigned long)(key.type << 16 | key.number),
+		return hash_long((unsigned long)(TYPE_GID << 16 | key.gid),
 					NS_KEY_HASH_SHIFT);
 	case TYPE_COMM:
-		return hash_string(key.string, NS_KEY_HASH_SHIFT);
+		return hash_string(key.name, NS_KEY_HASH_SHIFT);
 	default:
 		assert(0);
 	}
@@ -291,12 +294,22 @@ static struct namespace *namespace_find_key(uproc_key_t key)
 	hlist_for_each_entry(ns, n, &hash[ns_hashfn_key(key)], hlist_key) {
 		if (ns->key.type != key.type)
 			continue;
-		if (key.type == TYPE_COMM) {
-			if (!strncmp(ns->key.string, key.string, FILENAME_MAX))
+		switch (key.type) {
+		case TYPE_UID:
+			if (ns->key.uid == key.uid)
 				return ns;
-		} else {
-			if (ns->key.number == key.number)
+			break;
+		case TYPE_GID:
+			if (ns->key.gid == key.gid)
 				return ns;
+			break;
+		case TYPE_COMM:
+			if (!strncmp(ns->key.name, key.name, FILENAME_MAX))
+				return ns;
+			break;
+		default:
+			assert(0);
+			break;
 		}
 	}
 	return NULL;
@@ -346,7 +359,7 @@ static void namespace_del(struct namespace *ns)
 	hlist_del(&ns->hlist_key);
 	hlist_del(&ns->hlist_name);
 	if (ns->key.type == TYPE_COMM)
-		free(ns->key.string);
+		free(ns->key.name);
 	free(ns->name);
 	free(ns);
 }
@@ -444,17 +457,17 @@ static void pid_key_add(pid_t pid)
 		goto out;
 	pthread_rwlock_wrlock(&lock);
 	key.type = TYPE_UID;
-	key.number = uid;
+	key.uid = uid;
 	ns = namespace_find_key(key);
 	if (ns)
 		pid_add_item(ns, pid);
 	key.type = TYPE_GID;
-	key.number = gid;
+	key.gid = gid;
 	ns = namespace_find_key(key);
 	if (ns)
 		pid_add_item(ns, pid);
 	key.type = TYPE_COMM;
-	key.string = name;
+	key.name = name;
 	ns = namespace_find_key(key);
 	if (ns)
 		pid_add_item(ns, pid);
@@ -744,14 +757,14 @@ static int read_config(const char *file)
 		}
 		if (!strcmp(type_str, "uid")) {
 			key.type = TYPE_UID;
-			key.number = atoi(value);
+			key.uid = atoi(value);
 		} else if (!strcmp(type_str, "gid")) {
 			key.type = TYPE_GID;
-			key.number = atoi(value);
+			key.gid = atoi(value);
 		} else if (!strcmp(type_str, "cmd")) {
 			key.type = TYPE_COMM;
-			key.string = strdup(value);
-			if (!key.string) {
+			key.name = strndup(value, FILENAME_MAX);
+			if (!key.name) {
 				fprintf(stderr,
 					"ERROR: out of memory at %s:%d\n",
 					file, line_no);
