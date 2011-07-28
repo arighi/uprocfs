@@ -32,6 +32,8 @@
 
 #define DEFAULT_CONFIG_FILE	"/etc/uproc.conf"
 
+#include "config.h"
+
 #include "list.h"
 
 #include <assert.h>
