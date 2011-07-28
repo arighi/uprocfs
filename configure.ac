@@ -16,6 +16,7 @@ AC_PROG_CC
 AC_CHECK_HEADERS([stdlib.h string.h sys/socket.h linux/connector.h linux/cn_proc.h \
                   libgen.h unistd.h slang.h])
 
+AC_DEFINE_UNQUOTED([__BITS_PER_LONG], `getconf LONG_BIT`, [__BITS_PER_LONG])
 AC_DEFINE_UNQUOTED([PAGE_SIZE], `getconf PAGE_SIZE`, [PAGE_SIE])
 AC_DEFINE_UNQUOTED([CACHELINE_SIZE], `getconf LEVEL1_DCACHE_LINESIZE`, [CACHELINE_SIZE])
 

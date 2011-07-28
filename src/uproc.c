@@ -53,7 +53,6 @@
 #include <linux/netlink.h>
 #include <linux/connector.h>
 #include <linux/cn_proc.h>
-#include <asm/bitsperlong.h>
 
 /* The following macros are all used by the netlink code */
 #define NL_BUFF_SIZE	(16 * 1024 * 1024)
