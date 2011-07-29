@@ -28,7 +28,7 @@
 
 #define FUSE_USE_VERSION 29
 
-#define UPROCFS_VERSION __stringify(VERSION)
+#define UPROCFS_VERSION VERSION
 
 #define DEFAULT_CONFIG_FILE	"/etc/uproc.conf"
 

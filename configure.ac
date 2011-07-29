@@ -1,6 +1,7 @@
 #                                               -*- Autoconf -*-
 AC_PREREQ([2.59])
-AC_INIT([uprocfs], [0.3], [andrea@betterlinux.com])
+m4_include(version.m4)
+AC_INIT([uprocfs], [VERSION_NUMBER], [andrea@betterlinux.com])
 AC_CONFIG_SRCDIR([src/uproc.c])
 AC_CONFIG_HEADERS([config.h])
 

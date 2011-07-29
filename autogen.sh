@@ -5,4 +5,7 @@
 
 set -e
 
+# Get the version
+sh version.sh
+
 autoreconf -fi

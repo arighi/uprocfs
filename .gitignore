@@ -24,3 +24,5 @@ config.sub
 
 config.h.in
 config.h
+
+version.m4
