@@ -90,19 +90,25 @@ static pthread_rwlock_t lock;
 static volatile bool need_exit;
 
 /* Type of namespace rule */
+enum key_type_bits {
+	TYPE_UID_BIT = 0,
+	TYPE_GID_BIT,
+	TYPE_CMD_BIT,
+
+	__NR_TYPE_BIT,
+};
+
 enum key_type {
-	TYPE_UID = 0,
-	TYPE_GID,
-	TYPE_COMM,
+	TYPE_UID = 1 << TYPE_UID_BIT,
+	TYPE_GID = 1 << TYPE_GID_BIT,
+	TYPE_CMD = 1 << TYPE_CMD_BIT,
 };
 
 /* Generic key type to identify the value of a PID property */
 typedef struct {
-	union {
-		uid_t uid;
-		gid_t gid;
-		char *name;
-	};
+	uid_t uid;
+	gid_t gid;
+	char *name;
 	enum key_type type;
 } uproc_key_t;
 
@@ -151,18 +157,17 @@ static inline unsigned long pid_map_hashfn(pid_t pid)
 
 static inline unsigned long ns_hashfn_key(uproc_key_t key)
 {
-	switch (key.type) {
-	case TYPE_UID:
-		return hash_long((unsigned long)(TYPE_UID << 16 | key.uid),
-					NS_KEY_HASH_SHIFT);
-	case TYPE_GID:
-		return hash_long((unsigned long)(TYPE_GID << 16 | key.gid),
-					NS_KEY_HASH_SHIFT);
-	case TYPE_COMM:
-		return hash_string(key.name, NS_KEY_HASH_SHIFT);
-	default:
-		assert(0);
-	}
+	unsigned long hash = 0;
+
+	if (key.type & TYPE_UID)
+		hash ^= hash_long((unsigned long)(TYPE_UID << 16 |
+					key.uid), NS_KEY_HASH_SHIFT);
+	if (key.type & TYPE_GID)
+		hash ^= hash_long((unsigned long)(TYPE_GID << 16 |
+					key.gid), NS_KEY_HASH_SHIFT);
+	if (key.type & TYPE_CMD)
+		hash ^= hash_string(key.name, NS_KEY_HASH_SHIFT);
+	return hash;
 }
 
 static inline unsigned long ns_hashfn_name(const char *name)
@@ -303,8 +308,31 @@ static struct namespace *namespace_find_key(uproc_key_t key)
 			if (ns->key.gid == key.gid)
 				return ns;
 			break;
-		case TYPE_COMM:
+		case TYPE_CMD:
 			if (!strncmp(ns->key.name, key.name, FILENAME_MAX))
+				return ns;
+			break;
+		case TYPE_UID | TYPE_GID:
+			if (ns->key.uid == key.uid && ns->key.gid == key.gid)
+				return ns;
+			break;
+		case TYPE_UID | TYPE_CMD:
+			if (ns->key.uid == key.uid &&
+					!strncmp(ns->key.name, key.name,
+							FILENAME_MAX))
+				return ns;
+			break;
+		case TYPE_GID | TYPE_CMD:
+			if (ns->key.gid == key.gid &&
+					!strncmp(ns->key.name, key.name,
+							FILENAME_MAX))
+				return ns;
+			break;
+		case TYPE_UID | TYPE_GID | TYPE_CMD:
+			if (ns->key.uid == key.uid &&
+					ns->key.gid == key.gid &&
+					!strncmp(ns->key.name, key.name,
+							FILENAME_MAX))
 				return ns;
 			break;
 		default:
@@ -358,7 +386,7 @@ static void namespace_del(struct namespace *ns)
 {
 	hlist_del(&ns->hlist_key);
 	hlist_del(&ns->hlist_name);
-	if (ns->key.type == TYPE_COMM)
+	if (ns->key.type & TYPE_CMD)
 		free(ns->key.name);
 	free(ns->name);
 	free(ns);
@@ -466,7 +494,32 @@ static void pid_key_add(pid_t pid)
 	ns = namespace_find_key(key);
 	if (ns)
 		pid_add_item(ns, pid);
-	key.type = TYPE_COMM;
+	key.type = TYPE_CMD;
+	key.name = name;
+	ns = namespace_find_key(key);
+	if (ns)
+		pid_add_item(ns, pid);
+	key.type = TYPE_UID | TYPE_GID;
+	key.uid = uid;
+	key.gid = gid;
+	ns = namespace_find_key(key);
+	if (ns)
+		pid_add_item(ns, pid);
+	key.type = TYPE_UID | TYPE_CMD;
+	key.uid = uid;
+	key.name = name;
+	ns = namespace_find_key(key);
+	if (ns)
+		pid_add_item(ns, pid);
+	key.type = TYPE_GID | TYPE_CMD;
+	key.gid = gid;
+	key.name = name;
+	ns = namespace_find_key(key);
+	if (ns)
+		pid_add_item(ns, pid);
+	key.type = TYPE_UID | TYPE_GID | TYPE_CMD;
+	key.uid = uid;
+	key.gid = gid;
 	key.name = name;
 	ns = namespace_find_key(key);
 	if (ns)
@@ -718,15 +771,37 @@ static void strip_blank_tail(char *p)
 	*(s + 1) = '\0';
 }
 
+static int parse_key_value(char *s, const char *key, char **value)
+{
+	int key_len = strlen(key);
+
+	s = strstr(s, key);
+	if (!s)
+		return -ENOENT;
+	s += key_len;
+	strip_blank_head(&s);
+	if (!*s)
+		return -EINVAL;
+	*value = s;
+	return 0;
+}
+
+static char *parse_ns_name(char *s)
+{
+	size_t len = strnlen(s, FILENAME_MAX);
+	char *end = s + len - 1;
+
+	while (!isspace(*end) && end >= s)
+		end--;
+	return end + 1;
+}
+
 /* Simple config file parser */
 static int read_config(const char *file)
 {
 	char line[PAGE_SIZE];
-	char type_str[FILENAME_MAX];
-	char name[FILENAME_MAX];
-	char value[FILENAME_MAX];
 	uproc_key_t key;
-	char *p;
+	char *p, *s, *name;
 	FILE *f;
 	int line_no = 0;
 	int ret;
@@ -739,6 +814,7 @@ static int read_config(const char *file)
 		fprintf(stderr, "ERROR: couldn't open file %s\n", file);
 		return -ENOENT;
 	}
+
 	while ((p = fgets(line, sizeof(line), f)) != NULL) {
 		line_no++;
 
@@ -749,32 +825,49 @@ static int read_config(const char *file)
 		if (is_empty_or_comment(p))
 			continue;
 
-		ret = sscanf(line, "%256s %256s %256s", type_str, value, name);
-		if (ret != 3) {
-			fprintf(stderr, "ERROR: syntax error at %s:%d\n",
-					file, line_no);
-			return -EINVAL;
+		key.type = 0;
+
+		/* Get the name of the namespace first */
+		name = parse_ns_name(p);
+		if (!name)
+			continue;
+		/* Parse namespace attributes */
+		ret = parse_key_value(p, "uid", &s);
+		if (!ret) {
+			key.type |= TYPE_UID;
+			key.uid = atoi(s);
 		}
-		if (!strcmp(type_str, "uid")) {
-			key.type = TYPE_UID;
-			key.uid = atoi(value);
-		} else if (!strcmp(type_str, "gid")) {
-			key.type = TYPE_GID;
-			key.gid = atoi(value);
-		} else if (!strcmp(type_str, "cmd")) {
-			key.type = TYPE_COMM;
-			key.name = strndup(value, FILENAME_MAX);
+		ret = parse_key_value(p, "gid", &s);
+		if (!ret) {
+			key.type |= TYPE_GID;
+			key.gid = atoi(s);
+		}
+		/*
+		 * NOTE: must be the last rule, because it modifies the source
+		 * string.
+		 */
+		ret = parse_key_value(p, "cmd", &s);
+		if (!ret) {
+			char *end = s;
+
+			while (!isspace(*end))
+				end++;
+			*end = '\0';
+			key.type |= TYPE_CMD;
+			key.name = strndup(s, FILENAME_MAX);
 			if (!key.name) {
 				fprintf(stderr,
 					"ERROR: out of memory at %s:%d\n",
 					file, line_no);
 				return -ENOMEM;
 			}
-		} else {
-			fprintf(stderr, "ERROR: unknown type '%s' at %s:%d\n",
-					type_str, file, line_no);
+		}
+		if (!key.type) {
+			fprintf(stderr, "ERROR: malformed rule at %s:%d\n",
+					file, line_no);
 			return -EINVAL;
 		}
+		/* Register the namespace */
 		ret = namespace_add(key, name);
 		if (ret < 0) {
 			fprintf(stderr,
