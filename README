@@ -45,7 +45,7 @@ The user can define custom rules to create different PID namespaces inside
 uprocfs.
 
 A configuration file must be passed to the uproc daemon; the configuration file
-contains all the generic rules (at the moment based on the UID, GID or command
+contains all the generic rules (at the moment based on the UID, GID and command
 name of the tasks) to associate PIDs to different namespaces.
 
 Then, the daemon exports the different namespaces to the external
@@ -56,25 +56,32 @@ Configuration
 uproc uses /etc/uproc.conf as default configuration file.
 
 The configuration file contains a list of rules which assign a PID namespace to
-a defined group/user/command.
+a set of tasks according to their uid, gid and command name.
 
 Each rule is defined in the form:
 
- <type> <key> <name>
+  <key1> <val1> [<key2> <val2> ...]  <name>
 
 Where:
 
-   <type> can be:
-          - uid: select all tasks of a certain UID
-          - gid: select all tasks of a certain GID
-          - cmd: select all tasks that have a particular name
+  <key1>, <key2>, ... can be:
+         - uid: select all tasks of a certain UID
+         - gid: select all tasks of a certain GID
+         - cmd: select all tasks that have a particular name
 
-   <key> is:
-          - the UID number if <type> is "uid"
-          - the GID number if <type> is "gid"
-          - the program name string if <type> is "cmd"
+  <val1>, <val2>, ... are:
+         - the UID number if the key is "uid"
+         - the GID number if the key is "gid"
+         - the command name string if the key is "cmd"
 
-   <name> is the name of the namespace
+  <name> is the name of the namespace
+
+NOTE:
+  - uprocfs currently allows to define rules based on UIDs, GIDs and process
+    name.
+  - the same PID can be placed in multiple namespaces
+  - don't define multiple entries with the same namespace name! The name of
+    the namespace must be unique among all namespaces.
 
 A configuration file for starters can be auto-generated using the helper script
 tools/uproc-config.pl; for example:
@@ -149,7 +156,7 @@ Test case:
 
    - with uprocfs:
 
-     # time wc -l < /uproc/righiandr
+     # time wc -l < /uproc/my_user
      10057
 
      real	0m0.015s
@@ -186,18 +193,18 @@ NOTE: all the following examples assume uprocfs is mounted on /uproc.
 
 The configuration file used in this examples can be found in ./etc/uproc.conf.
 
- - show all the running PIDs of user "righiandr":
+ - show all the running PIDs of user "my_user":
 
-# cat /uproc/righiandr
+# cat /uproc/my_user
 
- - count the tasks of the user "righiandr":
+ - count the tasks of the user "my_user":
 
-# wc -l < /uproc/righiandr
-55 /uproc/righiandr
+# wc -l < /uproc/my_user
+55 /uproc/my_user
 
- - show all programs currently executed by user "righiandr":
+ - show all programs currently executed by user "my_user":
 
-# cat $(sed 's:.*:/proc/&/comm:' /uproc/righiandr) | sort -u
+# cat $(sed 's:.*:/proc/&/comm:' /uproc/my_user) | sort -u
 bash
 dbus-daemon
 dbus-launch
@@ -225,15 +232,15 @@ ssh-agent
 syndaemon
 xterm
 
- - send a SIGTERM to all processes of user "righiandr" (kill all sessions):
+ - send a SIGTERM to all processes of user "my_user" (kill all sessions):
 
-# kill `cat /uproc/righiandr`
+# kill `cat /uproc/my_user`
 
- - show all bytes read and written by "righiandr" from block devices:
+ - show all bytes read and written by "my_user" from block devices:
 
-# echo `sed -ne "s/^read_bytes: //p" $(sed 's:.*:/proc/&/io:' /uproc/righiandr) | tr "\n" +`0 | bc -l
+# echo `sed -ne "s/^read_bytes: //p" $(sed 's:.*:/proc/&/io:' /uproc/my_user) | tr "\n" +`0 | bc -l
 141639680
-# echo `sed -ne "s/^write_bytes: //p" $(sed 's:.*:/proc/&/io:' /uproc/righiandr) | tr "\n" +`0 | bc -l
+# echo `sed -ne "s/^write_bytes: //p" $(sed 's:.*:/proc/&/io:' /uproc/my_user) | tr "\n" +`0 | bc -l
 4071424
 
 BUGS
