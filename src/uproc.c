@@ -995,7 +995,18 @@ static int _uproc_read(const struct namespace *ns, char *buf, size_t size,
 
 	pthread_rwlock_rdlock(&lock);
 	for_each_namespace_pid(ns, item) {
-		len = min(snprintf(buf, size, "%u\n", item->pid), size);
+		char str[FILENAME_MAX];
+		size_t count;
+
+		count = min(snprintf(str, sizeof(str), "%u\n", item->pid),
+				FILENAME_MAX);
+		if (offset >= count) {
+			offset -= count;
+			continue;
+		}
+
+		len = min(count, size);
+		memcpy(buf, str, count);
 
 		buf += len;
 		size -= len;
