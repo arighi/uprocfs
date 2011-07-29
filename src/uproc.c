@@ -364,6 +364,8 @@ static int namespace_add(uproc_key_t key, const char *name)
 	/* Santiy check: avoid duplicate namespaces */
 	if (namespace_find_key(key))
 		return -EADDRINUSE;
+	if (namespace_find_name(name))
+		return -EADDRINUSE;
 	/* Initialize and insert the new namespace */
 	ns = calloc(1, sizeof(*ns));
 	if (unlikely(!ns))
@@ -870,9 +872,8 @@ static int read_config(const char *file)
 		/* Register the namespace */
 		ret = namespace_add(key, name);
 		if (ret < 0) {
-			fprintf(stderr,
-				"ERROR: couldn't register namespace %s: %d\n",
-				name, ret);
+			fprintf(stderr, "ERROR: %s at %s:%d\n",
+				strerror(-ret), file, line_no);
 			return ret;
 		}
 	}
