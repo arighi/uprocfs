@@ -53,6 +53,8 @@
 #include <linux/netlink.h>
 #include <linux/connector.h>
 #include <linux/cn_proc.h>
+#include <linux/filter.h>
+#include <arpa/inet.h>
 
 /* The following macros are all used by the netlink code */
 #define NL_BUFF_SIZE	(16 * 1024 * 1024)
@@ -109,7 +111,7 @@ typedef struct {
 	uid_t uid;
 	gid_t gid;
 	char *name;
-	enum key_type type;
+	unsigned long type;
 } uproc_key_t;
 
 /* Internal hash structures */
@@ -552,6 +554,38 @@ static void pid_key_update(pid_t pid)
 
 /*** netlink stuff ***/
 
+static int nl_set_filter(int nl_sock)
+{
+	struct sock_filter filter[] = {
+		/* Load nlmsg_type from nlmsghdr packet */
+		BPF_STMT(BPF_LD | BPF_H | BPF_ABS,
+			  offsetof(struct nlmsghdr, nlmsg_type)),
+		/* Go ahead if it is NLMSG_DONE, else go to L2 */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htons(NLMSG_DONE), 0, 5),
+
+		/* Check for CN_IDX_PROC and CN_VAL_PROC */
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+				NLMSG_LENGTH(0) + offsetof(struct cn_msg, id) +
+					offsetof(struct cb_id, idx)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htonl(CN_IDX_PROC), 0, 3),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+				NLMSG_LENGTH(0) + offsetof(struct cn_msg, id) +
+					offsetof(struct cb_id, val)),
+		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, htonl(CN_VAL_PROC), 0, 1),
+
+		/* Accept packet */
+		BPF_STMT(BPF_RET|BPF_K, 0x0fffffff),
+		/* L2: discard packet */
+		BPF_STMT(BPF_RET|BPF_K, 0),
+	};
+	struct sock_fprog fprog = {
+		.filter = filter,
+		.len = ARRAY_SIZE(filter),
+	};
+	return setsockopt(nl_sock, SOL_SOCKET, SO_ATTACH_FILTER,
+				&fprog, sizeof(fprog));
+}
+
 static int nl_connect(void)
 {
 	struct sockaddr_nl sa_nl = {};
@@ -564,6 +598,12 @@ static int nl_connect(void)
 		perror("socket");
 		return nl_sock;
 	}
+	/* Configure socket filtering */
+	ret = nl_set_filter(nl_sock);
+	if (ret < 0)
+		fprintf(stderr,
+			"WARNING: couldn't configure socket filter: %d\n", errno);
+
 	/* Try to override buffer size */
         if (setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUFFORCE,
 				&buffersize, sizeof(buffersize))) {
