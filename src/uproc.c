@@ -554,29 +554,37 @@ static void pid_key_update(pid_t pid)
 
 /*** netlink stuff ***/
 
+#define DROP_PROC_EVENT(__e)						\
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, NLMSG_LENGTH(0) +	\
+				offsetof(struct cn_msg, data) +		\
+				offsetof(struct proc_event, what)),	\
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,			\
+				htonl(__e), 0, 1),			\
+		BPF_STMT(BPF_RET | BPF_K, 0)
+
 static int nl_set_filter(int nl_sock)
 {
 	struct sock_filter filter[] = {
-		/* Load nlmsg_type from nlmsghdr packet */
-		BPF_STMT(BPF_LD | BPF_H | BPF_ABS,
-			  offsetof(struct nlmsghdr, nlmsg_type)),
-		/* Go ahead if it is NLMSG_DONE, else go to L2 */
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htons(NLMSG_DONE), 0, 5),
-
-		/* Check for CN_IDX_PROC and CN_VAL_PROC */
+		/* Check for CN_IDX_PROC (be sure it's a proc connector msg) */
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
 				NLMSG_LENGTH(0) + offsetof(struct cn_msg, id) +
 					offsetof(struct cb_id, idx)),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htonl(CN_IDX_PROC), 0, 3),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htonl(CN_IDX_PROC), 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, 0),
+
+		/* Check for CN_VAL_PROC (be sure it's a proc connector msg) */
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
 				NLMSG_LENGTH(0) + offsetof(struct cn_msg, id) +
 					offsetof(struct cb_id, val)),
-		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, htonl(CN_VAL_PROC), 0, 1),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htonl(CN_VAL_PROC), 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, 0),
 
-		/* Accept packet */
-		BPF_STMT(BPF_RET|BPF_K, 0x0fffffff),
-		/* L2: discard packet */
-		BPF_STMT(BPF_RET|BPF_K, 0),
+		/* Drop unused proc connector events */
+		DROP_PROC_EVENT(PROC_EVENT_NONE),
+		DROP_PROC_EVENT(PROC_EVENT_SID),
+
+		/* Accept the packet */
+		BPF_STMT(BPF_RET | BPF_K, 0x0fffffff),
 	};
 	struct sock_fprog fprog = {
 		.filter = filter,
@@ -686,6 +694,7 @@ static void handle_proc_ev(const struct cn_msg *cn_hdr)
 		pid_key_remove(pid);
 		break;
 	default:
+		fprintf(stderr, "WARNING: unexpected event %d\n", ev->what);
 		break;
 	}
 }
