@@ -114,6 +114,59 @@ typedef struct {
 	unsigned long type;
 } uproc_key_t;
 
+struct feature {
+	unsigned long type;
+};
+
+static bool uid_cmp(const uproc_key_t *k1, const uproc_key_t *k2)
+{
+	return k1->uid == k2->uid;
+}
+
+static bool gid_cmp(const uproc_key_t *k1, const uproc_key_t *k2)
+{
+	return k1->gid == k2->gid;
+}
+
+static bool cmd_cmp(const uproc_key_t *k1, const uproc_key_t *k2)
+{
+	return !strncmp(k1->name, k2->name, FILENAME_MAX);
+}
+
+static bool key_cmp(const uproc_key_t *k1, const uproc_key_t *k2)
+{
+	if (k1->type != k2->type)
+		return false;
+	switch (k1->type) {
+	case TYPE_UID:
+		return uid_cmp(k1, k2);
+	case TYPE_GID:
+		return gid_cmp(k1, k2);
+	case TYPE_CMD:
+		return cmd_cmp(k1, k2);
+	case TYPE_UID | TYPE_GID:
+		return uid_cmp(k1, k2) && gid_cmp(k1, k2);
+	case TYPE_UID | TYPE_CMD:
+		return uid_cmp(k1, k2) && cmd_cmp(k1, k2);
+	case TYPE_GID | TYPE_CMD:
+		return gid_cmp(k1, k2) && cmd_cmp(k1, k2);
+	case TYPE_UID | TYPE_GID | TYPE_CMD:
+		return uid_cmp(k1, k2) && gid_cmp(k1, k2) && cmd_cmp(k1, k2);
+	default:
+		assert(0);
+	}
+}
+
+static const struct feature features[] = {
+	{ .type = TYPE_UID },
+	{ .type = TYPE_GID },
+	{ .type = TYPE_CMD },
+	{ .type = TYPE_UID | TYPE_GID },
+	{ .type = TYPE_UID | TYPE_CMD },
+	{ .type = TYPE_GID | TYPE_CMD },
+	{ .type = TYPE_UID | TYPE_GID | TYPE_CMD },
+};
+
 /* Internal hash structures */
 #define NS_KEY_HASH_SHIFT	9
 #define NS_KEY_HASH_SIZE	(1UL << NS_KEY_HASH_SHIFT)
@@ -298,50 +351,9 @@ static struct namespace *namespace_find_key(uproc_key_t key)
 	struct namespace *ns;
 	struct hlist_node *n;
 
-	hlist_for_each_entry(ns, n, &hash[ns_hashfn_key(key)], hlist_key) {
-		if (ns->key.type != key.type)
-			continue;
-		switch (key.type) {
-		case TYPE_UID:
-			if (ns->key.uid == key.uid)
-				return ns;
-			break;
-		case TYPE_GID:
-			if (ns->key.gid == key.gid)
-				return ns;
-			break;
-		case TYPE_CMD:
-			if (!strncmp(ns->key.name, key.name, FILENAME_MAX))
-				return ns;
-			break;
-		case TYPE_UID | TYPE_GID:
-			if (ns->key.uid == key.uid && ns->key.gid == key.gid)
-				return ns;
-			break;
-		case TYPE_UID | TYPE_CMD:
-			if (ns->key.uid == key.uid &&
-					!strncmp(ns->key.name, key.name,
-							FILENAME_MAX))
-				return ns;
-			break;
-		case TYPE_GID | TYPE_CMD:
-			if (ns->key.gid == key.gid &&
-					!strncmp(ns->key.name, key.name,
-							FILENAME_MAX))
-				return ns;
-			break;
-		case TYPE_UID | TYPE_GID | TYPE_CMD:
-			if (ns->key.uid == key.uid &&
-					ns->key.gid == key.gid &&
-					!strncmp(ns->key.name, key.name,
-							FILENAME_MAX))
-				return ns;
-			break;
-		default:
-			assert(0);
-			break;
-		}
-	}
+	hlist_for_each_entry(ns, n, &hash[ns_hashfn_key(key)], hlist_key)
+		if (key_cmp(&ns->key, &key))
+			return ns;
 	return NULL;
 }
 
@@ -480,57 +492,21 @@ get_info_from_procfs(pid_t pid, uid_t *euid, gid_t *egid, char **name)
 static void pid_key_add(pid_t pid)
 {
 	struct namespace *ns;
-	uproc_key_t key;
-	uid_t uid;
-	gid_t gid;
-	char *name = NULL;
+	uproc_key_t key = {};
+	int i;
 
-	if (get_info_from_procfs(pid, &uid, &gid, &name) < 0)
+	if (get_info_from_procfs(pid, &key.uid, &key.gid, &key.name) < 0)
 		goto out;
 	pthread_rwlock_wrlock(&lock);
-	key.type = TYPE_UID;
-	key.uid = uid;
-	ns = namespace_find_key(key);
-	if (ns)
-		pid_add_item(ns, pid);
-	key.type = TYPE_GID;
-	key.gid = gid;
-	ns = namespace_find_key(key);
-	if (ns)
-		pid_add_item(ns, pid);
-	key.type = TYPE_CMD;
-	key.name = name;
-	ns = namespace_find_key(key);
-	if (ns)
-		pid_add_item(ns, pid);
-	key.type = TYPE_UID | TYPE_GID;
-	key.uid = uid;
-	key.gid = gid;
-	ns = namespace_find_key(key);
-	if (ns)
-		pid_add_item(ns, pid);
-	key.type = TYPE_UID | TYPE_CMD;
-	key.uid = uid;
-	key.name = name;
-	ns = namespace_find_key(key);
-	if (ns)
-		pid_add_item(ns, pid);
-	key.type = TYPE_GID | TYPE_CMD;
-	key.gid = gid;
-	key.name = name;
-	ns = namespace_find_key(key);
-	if (ns)
-		pid_add_item(ns, pid);
-	key.type = TYPE_UID | TYPE_GID | TYPE_CMD;
-	key.uid = uid;
-	key.gid = gid;
-	key.name = name;
-	ns = namespace_find_key(key);
-	if (ns)
-		pid_add_item(ns, pid);
+	for (i = 0; i < ARRAY_SIZE(features); i++) {
+		key.type = features[i].type;
+		ns = namespace_find_key(key);
+		if (ns)
+			pid_add_item(ns, pid);
+	}
 	pthread_rwlock_unlock(&lock);
 out:
-	free(name);
+	free(key.name);
 }
 
 /*
