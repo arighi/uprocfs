@@ -10,6 +10,26 @@ informations without scanning all the files under /proc.
 uprocfs is designed to be ultra-super-fast to retrieve specific informations,
 compared to the standard procfs interface.
 
+Installation
+~~~~~~~~~~~~
+ - Requirement
+     autoconf 2.5x, preferably 2.59 or later
+     automake 1.7 or later
+     libfuse-dev or fuse-devel
+     slang-dev
+
+
+First run
+   $ ./autogen.sh
+to create all the necessary files.
+Then the standard
+   $ ./configure
+   $ ./make
+   $ ./make install
+will compile and install the program on your system
+
+
+
 Design
 ~~~~~~
 The basic idea is to provide a facility to implement different views of the

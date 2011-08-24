@@ -17,7 +17,10 @@ m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 AC_PROG_CC
 
 AC_CHECK_HEADERS([stdlib.h string.h sys/socket.h linux/connector.h linux/cn_proc.h \
-                  libgen.h unistd.h slang.h])
+                  libgen.h unistd.h slang.h], [], [AC_ERROR(an include library is missing libgen.h unistd.h slang.h)])
+
+#TODO add slang.h
+
 
 AC_DEFINE_UNQUOTED([__BITS_PER_LONG], `getconf LONG_BIT`, [__BITS_PER_LONG])
 AC_DEFINE_UNQUOTED([PAGE_SIZE], `getconf PAGE_SIZE`, [PAGE_SIE])
