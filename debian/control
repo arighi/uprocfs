@@ -1,0 +1,15 @@
+Source: uprocfs
+Section: misc
+Priority: optional
+Maintainer: Andrea Righi <andrea.righi@canonical.com>
+Build-Depends: debhelper (>= 11), autotools-dev
+Standards-Version: 4.1.3
+
+Package: uprocfs
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: uprocfs is a user-space implementation of the kernel's procfs
+ Its purpose is not to replace procfs, but to speed up the retrievel of certain
+ informations without scanning all the files under /proc. It is designed to be
+ ultra-super-fast to retrieve specific informations, compared to the standard
+ procfs interface.
