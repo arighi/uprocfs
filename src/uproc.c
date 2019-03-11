@@ -949,8 +949,18 @@ static int uproc_readdir(const char *path, void *buf,
 	int i;
 
 	if (!strcmp(path, "/")) {
-		for_each_namespace(ns, i, n)
+		for_each_namespace(ns, i, n) {
+			uid_t uid = fuse_get_context()->uid;
+			uid_t gid = fuse_get_context()->gid;
+
+			if (uid && ns->key.type & TYPE_UID &&
+					uid != ns->key.uid)
+				continue;
+			if (gid && ns->key.type & TYPE_GID &&
+					gid != ns->key.gid)
+				continue;
 			filler(buf, ns->name, NULL, 0);
+		}
 		return 0;
 	}
 	return -ENOENT;
